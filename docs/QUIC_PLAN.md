@@ -110,6 +110,19 @@ docs/                RFC 原文 + 方案 + 测试记录
 | **M5** | HTTP/3：控制流、QPACK、请求/响应、GOAWAY、错误处理 | 本地 aioquic 服务端 GET 200；公网 cloudflare-quic.com GET 200 |
 | **M6** | 加固：并发收发、超时、0-RTT / 会话恢复（可选）、服务端（可选）、文档与示例 | 压测 + 异常包鲁棒性测试 |
 
+> **实施状态（2026-11-16）**：M0–M3 已完成并验证；M4 的握手/流已通但缺丢包恢复；
+> M5 本地 200 已通、公网未测；M6 未开始。逐项证据与缺口见 `quic/docs/STATUS.md`。
+
+| 阶段 | 状态 | 证据 / 尚缺 |
+|---|---|---|
+| M0 | ✅ 完成 | `cjpm build` / `cjpm test`（28/28） |
+| M1 | 🟡 主要完成 | SHA-2、HMAC、HKDF、AES-128/256、AES-GCM、BigUint/Montgomery、X25519、P-256/P-384 ECDSA、RSA PKCS#1 v1.5、DER/PEM/X.509 均过向量；缺 ChaCha20-Poly1305、Ed25519、RSA-PSS |
+| M2 | ✅ 完成（QUIC profile） | 与 aioquic 握手成功，服务端 keylog 的 hs/ap traffic secret 与本地派生值逐字节一致；缺 HRR、P-256 key share、RSA-PSS 验签、KeyUpdate、会话恢复 |
+| M3 | ✅ 完成 | RFC 9001 A.2 客户端 Initial 同输入重编码逐字节一致，A.3 服务端 Initial 解密通过 |
+| M4 | 🟡 部分完成 | 握手、ACK、CRYPTO 重组、STREAM、流控字段已通；缺 1-RTT 丢包重传、拥塞控制、连接迁移、Retry / Version Negotiation |
+| M5 | 🟡 部分完成 | 本地 aioquic GET 返回 200 + 响应体；公网未验证；无 push、GOAWAY、动态表编码 |
+| M6 | ⬜ 未开始 | 压测、异常包鲁棒性、服务端（可选）、文档完善 |
+
 ---
 
 ## 4. 关键设计决策
@@ -117,7 +130,8 @@ docs/                RFC 原文 + 方案 + 测试记录
 ### 4.1 内存与性能
 - 自建 `Buf`（`Array<UInt8>` + `readPos/writePos`），所有编解码零额外分配；帧解析用 `(offset,len)` 游标。
 - 加密热路径全部 `@OverflowWrapping`，避免溢出检查开销。
-- UDP 单 socket + 1 收包线程 + 1 定时器线程；连接状态用 `Mutex` 保护，避免复杂锁层级。
+- **实际实现**：单 UDP socket + 同步轮询（`pollOnce()` 由调用方驱动，无后台线程），
+  握手阶段由 `handshake()` 按 250ms 重发；因此天然适配 Android/Termux，不需要锁。
 - 接收缓冲 64KB（QUIC 数据报上限 1500，留余量）。
 
 ### 4.2 正确性优先
@@ -132,8 +146,9 @@ docs/                RFC 原文 + 方案 + 测试记录
 
 ### 4.4 兼容性范围
 - QUIC v1（0x00000001）；收到 Version Negotiation 报错并提示。
-- TLS 1.3 仅；cipher suite：`TLS_AES_128_GCM_SHA256`、`TLS_AES_256_GCM_SHA384`、`TLS_CHACHA20_POLY1305_SHA256`。
-- 密钥交换：X25519 为主，P-256 兜底（HRR）。
+- TLS 1.3 仅；**已实现** cipher suite：`TLS_AES_128_GCM_SHA256`、`TLS_AES_256_GCM_SHA384`
+  （`TLS_CHACHA20_POLY1305_SHA256` 为后续目标，尚未实现）。
+- 密钥交换：**已实现** X25519；P-256 key share 与 HRR 为后续目标。
 - HTTP/3：无 push、无 0-RTT（后续可加）、支持 DATAGRAM 以外的标准帧。
 
 ---
