@@ -128,4 +128,24 @@ docs/rfc/           RFC 9000/9001/9002/9114/9204/7541/8446 原文
 
 ## 许可证
 
-仓库暂未附带许可证文件。对外分发或接受外部贡献前请先补充（如 Apache-2.0 / MIT）。
+本项目采用 [Apache License 2.0](LICENSE) 授权，版权归 Soffd 所有（Copyright 2026 Soffd）。
+
+```
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+要点：允许商用、修改与再分发；再分发时需保留版权与许可声明、标注修改过的文件；
+附带专利授权（同时禁止贡献者发起专利诉讼）。
+
+> 注：`docs/rfc/` 下的 RFC 原文版权归 IETF Trust，按其文档许可条款使用，
+> 不在本项目的 Apache-2.0 授权范围内。
