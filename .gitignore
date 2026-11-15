@@ -18,3 +18,7 @@ __pycache__/
 # Editor / OS
 .DS_Store
 *.swp
+
+# 编辑器/工具的备份文件
+*.bak
+*.orig
