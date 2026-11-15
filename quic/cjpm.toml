@@ -1,0 +1,8 @@
+[package]
+  cjc-version = "1.2.1"
+  name = "quic"
+  version = "0.1.0"
+  description = "Pure-Cangjie QUIC v1 / HTTP3 library"
+  output-type = "static"
+
+[dependencies]

@@ -1,0 +1,854 @@
+package quic.transport
+
+import quic.crypto.*
+import quic.tls.*
+import std.net.*
+import std.time.*
+
+/*
+ * QUIC v1 client connection: handshake, ACK, streams, flow control and a
+ * timer-based PTO retransmission. Synchronous design: the caller polls.
+ */
+
+public class QuicStream {
+    public var id: Int64 = 0
+    public var sendBuf: Array<UInt8> = Array<UInt8>(0, repeat: 0)
+    public var sendOff: Int64 = 0
+    public var ackedOff: Int64 = 0
+    public var finSent: Bool = false
+    public var finQueued: Bool = false
+    public var recvBuf: ByteWriter = ByteWriter(1024)
+    public var recvOff: Int64 = 0
+    public var recvFin: Bool = false
+    public var recvFinOffset: Int64 = -1
+    public var pending: Array<Array<UInt8>> = Array<Array<UInt8>>(4, repeat: Array<UInt8>(0, repeat: 0))
+    public var pendingOff: Array<Int64> = Array<Int64>(4, repeat: 0)
+    public var pendingCount: Int64 = 0
+    public var maxSend: Int64 = 262144
+}
+
+class SentPacket {
+    var pn: Int64 = 0
+    var space: Int64 = 0
+    var time: Int64 = 0
+    var size: Int64 = 0
+    var used: Bool = false
+}
+
+public class QuicConnection {
+    public let host: String
+    public let port: UInt16
+    let socket: UdpSocket
+    let peer: IPSocketAddress
+
+    var dcid: Array<UInt8>
+    var scid: Array<UInt8>
+    var peerCid: Array<UInt8>
+
+    var tls: TlsClient
+    var tp: TransportParams
+    var peerTp: TransportParams
+
+    var initialClient: PacketKeys
+    var initialServer: PacketKeys
+    var handshakeClient: PacketKeys
+    var handshakeServer: PacketKeys
+    var appClient: PacketKeys
+    var appServer: PacketKeys
+
+    var nextPnInitial: Int64 = 0
+    var nextPnHandshake: Int64 = 0
+    var nextPnApp: Int64 = 0
+    var largestRecvInitial: Int64 = -1
+    var largestRecvHandshake: Int64 = -1
+    var largestRecvApp: Int64 = -1
+    var recvInitial: Array<Int64>
+    var recvHandshake: Array<Int64>
+    var recvApp: Array<Int64>
+    var recvInitialCount: Int64 = 0
+    var recvHandshakeCount: Int64 = 0
+    var recvAppCount: Int64 = 0
+
+    var cryptoInInitial: ByteWriter
+    var cryptoInHandshake: ByteWriter
+    var clientHello: Array<UInt8>
+    var cryptoHsOut: ByteWriter
+    var cryptoHsOffset: Int64 = 0
+
+    var streamIds: Array<Int64>
+    var streamObjs: Array<QuicStream>
+    var streamCount: Int64 = 0
+
+    var sent: Array<SentPacket>
+    var sentCount: Int64 = 0
+
+    var srtt: Int64 = 0
+    var latestRtt: Int64 = 0
+    var ptoCount: Int64 = 0
+    var lastSendTime: Int64 = 0
+
+    public var established: Bool = false
+    public var handshakeDone: Bool = false
+    public var closed: Bool = false
+    public var closeReason: String = ""
+    public var lastError: String = ""
+    public var rxCount: Int64 = 0
+    public var peerAppParams: Array<UInt8> = Array<UInt8>(0, repeat: 0)
+
+    private init(host: String, port: UInt16, socket: UdpSocket, peer: IPSocketAddress,
+        dcid: Array<UInt8>) {
+        this.host = host
+        this.port = port
+        this.socket = socket
+        this.peer = peer
+        this.dcid = dcid
+        scid = randomBytes(8)
+        peerCid = Array<UInt8>(0, repeat: 0)
+        tp = TransportParams()
+        tp.initialSourceConnectionId = scid
+        peerTp = TransportParams()
+        initialClient = PacketKeys([], [], [])
+        initialServer = PacketKeys([], [], [])
+        handshakeClient = PacketKeys([], [], [])
+        handshakeServer = PacketKeys([], [], [])
+        appClient = PacketKeys([], [], [])
+        appServer = PacketKeys([], [], [])
+        recvInitial = Array<Int64>(64, repeat: -1)
+        recvHandshake = Array<Int64>(64, repeat: -1)
+        recvApp = Array<Int64>(64, repeat: -1)
+        cryptoInInitial = ByteWriter(2048)
+        cryptoInHandshake = ByteWriter(4096)
+        clientHello = Array<UInt8>(0, repeat: 0)
+        cryptoHsOut = ByteWriter(1024)
+        streamIds = Array<Int64>(16, repeat: 0)
+        streamObjs = Array<QuicStream>(16, repeat: QuicStream())
+        sent = Array<SentPacket>(256, repeat: SentPacket())
+        tls = TlsClient(host, "h3", tp.encode(), TrustStore(), false)
+    }
+
+    public static func dial(host: String, port: UInt16, store: TrustStore,
+        verifyPeer: Bool): QuicConnection {
+        let dcid = randomBytes(8)
+        let socket = UdpSocket(bindAt: IPSocketAddress("0.0.0.0", 0))
+        socket.bind()
+        socket.receiveTimeout = Some(Duration.millisecond * 100)
+        var ip = IPAddress.resolve(AddressFamily.INET, host)
+        if (ip.size == 0) {
+            ip = IPAddress.resolve(host)
+        }
+        if (ip.size == 0) {
+            throw Exception("cannot resolve ${host}")
+        }
+        let peer = IPSocketAddress(ip[0], port)
+        let conn = QuicConnection(host, port, socket, peer, dcid)
+        let (c, s) = PacketCrypto.initialSecrets(dcid)
+        conn.initialClient = c
+        conn.initialServer = s
+        conn.tls = TlsClient(host, "h3", conn.tp.encode(), store, verifyPeer)
+        conn.clientHello = conn.tls.start()
+        return conn
+    }
+
+    // ------------------------------------------------------------------
+
+    private func writePn(w: ByteWriter, pn: Int64, n: Int64): Unit {
+        var i = n - 1
+        while (i >= 0) {
+            w.putU8(UInt8((pn >> UInt64(i * 8)) & 0xFF))
+            i--
+        }
+    }
+
+    private func encodeAck(space: Int64): Array<UInt8> {
+        let w = ByteWriter(64)
+        let count = if (space == 0) { recvInitialCount } else if (space == 1) {
+            recvHandshakeCount
+        } else {
+            recvAppCount
+        }
+        if (count == 0) {
+            return w.toArray()
+        }
+        let arr = if (space == 0) { recvInitial } else if (space == 1) {
+            recvHandshake
+        } else {
+            recvApp
+        }
+        let largest = arr[count - 1]
+        let ranges = Array<Int64>(128, repeat: 0)
+        var rangeCount: Int64 = 0
+        var i = count - 1
+        while (i >= 0) {
+            let hi = arr[i]
+            var lo = hi
+            while (i > 0 && arr[i - 1] == lo - 1) {
+                lo = arr[i - 1]
+                i--
+            }
+            ranges[rangeCount * 2] = hi
+            ranges[rangeCount * 2 + 1] = lo
+            rangeCount++
+            i--
+        }
+        w.putU8(0x02)
+        Varint.write(w, UInt64(largest))
+        Varint.write(w, 0)
+        Varint.write(w, UInt64(rangeCount - 1))
+        // First ACK Range (RFC 9000 section 19.3), then the gap/range pairs.
+        Varint.write(w, UInt64(ranges[0] - ranges[1]))
+        var k: Int64 = 1
+        while (k < rangeCount) {
+            let prevLo = ranges[(k - 1) * 2 + 1]
+            let hi = ranges[k * 2]
+            let lo = ranges[k * 2 + 1]
+            Varint.write(w, UInt64(prevLo - hi - 2))
+            Varint.write(w, UInt64(hi - lo))
+            k++
+        }
+        return w.toArray()
+    }
+
+    private func buildLongPacket(space: Int64, payload: Array<UInt8>, padTo: Int64): Array<UInt8> {
+        let isInitial = space == 0
+        let keys = if (isInitial) {
+            initialClient
+        } else {
+            handshakeClient
+        }
+        let pn = if (isInitial) {
+            nextPnInitial
+        } else {
+            nextPnHandshake
+        }
+        if (isInitial) {
+            nextPnInitial++
+        } else {
+            nextPnHandshake++
+        }
+        let packet = PacketBuilder.longHeader(space, dcid, scid, Array<UInt8>(0, repeat: 0), pn,
+            2, keys, payload, padTo)
+        recordSent(pn, space, packet.size)
+        return packet
+    }
+
+    private func buildShortPacket(payload: Array<UInt8>): Array<UInt8> {
+        let pn = nextPnApp
+        nextPnApp++
+        let packet = PacketBuilder.shortHeader(dcid, pn, 2, appClient, payload)
+
+        recordSent(pn, 2, packet.size)
+        return packet
+    }
+
+    private func recordSent(pn: Int64, space: Int64, size: Int64): Unit {
+        var p: SentPacket
+        if (sentCount < sent.size) {
+            p = sent[sentCount]
+            sentCount++
+        } else {
+            p = SentPacket()
+        }
+        p.pn = pn
+        p.space = space
+        p.time = nowMillis()
+        p.size = size
+        p.used = true
+        lastSendTime = p.time
+    }
+
+    private func sendDatagram(packet: Array<UInt8>): Unit {
+        try {
+            socket.sendTo(peer, packet)
+        } catch (e: Exception) {
+            lastError = "send failed: ${e}"
+        }
+    }
+
+    public func pollOnce(): Bool {
+        let buf = Array<UInt8>(2048, repeat: 0)
+        var n: Int64 = 0
+        try {
+            n = socket.receiveFrom(buf)[1]
+        } catch (e: Exception) {
+            return false
+        }
+        if (n <= 0) {
+            return false
+        }
+        rxCount++
+        if (debug && rxCount <= 10) {
+            println("DBG rx pkt=" + hexEncode(sliceBytes(buf, 0, n)))
+        }
+        try {
+            processDatagram(sliceBytes(buf, 0, n))
+        } catch (e: Exception) {
+            lastError = "parse error: ${e}"
+            if (debug) {
+                println("DBG parse error: ${e}")
+            }
+        }
+        return true
+    }
+
+    private func processDatagram(data: Array<UInt8>): Unit {
+        var off: Int64 = 0
+        while (off + 1 < data.size) {
+            let b0 = data[off]
+            if ((b0 & 0x80) != 0) {
+                if (off + 7 > data.size) {
+                    return
+                }
+                let version = beU32(data, off + 1)
+                if (version == 0) {
+                    // Version negotiation is not supported: QUIC v1 only.
+                    return
+                }
+                let typeBits = Int64((b0 >> 4) & 0x03)
+                if (typeBits == 3) {
+                    return
+                }
+                let dcil = Int64(data[off + 5])
+                var p = off + 6 + dcil
+                if (p + 1 > data.size) {
+                    return
+                }
+                let scil = Int64(data[p])
+                if (p + 1 + scil > data.size) {
+                    return
+                }
+                let peerScid = sliceBytes(data, p + 1, scil)
+                p = p + 1 + scil
+                if (typeBits == 0) {
+                    let tr = ByteReader(data, p, data.size)
+                    let tokenLen = Int64(Varint.read(tr))
+                    p = tr.pos + tokenLen
+                }
+                let lr = ByteReader(data, p, data.size)
+                let lengthVal = Int64(Varint.read(lr))
+                let pnOffset = lr.pos
+                let pktEnd = pnOffset + lengthVal
+                if (pnOffset + 4 + 16 > data.size || pktEnd > data.size) {
+                    return
+                }
+                // Initial=00, 0-RTT=01, Handshake=10 (RFC 9000 section 17.2).
+                let space = if (typeBits == 0) {
+                    0
+                } else if (typeBits == 2) {
+                    1
+                } else {
+                    2
+                }
+                let keys = if (space == 0) {
+                    initialServer
+                } else if (space == 1) {
+                    handshakeServer
+                } else {
+                    appServer
+                }
+                if (keys.hp.size == 0) {
+                    if (debug) {
+                        println("DBG skip space=${space} off=${off} pktEnd=${pktEnd} (no keys)")
+                    }
+                    return
+                }
+                if (debug) {
+                    println("DBG long off=${off} type=${typeBits} space=${space} pktEnd=${pktEnd}")
+                }
+                // From the first server packet onwards the destination CID is the
+                // server-chosen source CID (RFC 9000 section 7.2).
+                if (peerScid.size > 0 && space != 2) {
+                    peerCid = peerScid
+                    dcid = peerScid
+                }
+                let largest = if (space == 0) {
+                    largestRecvInitial
+                } else if (space == 1) {
+                    largestRecvHandshake
+                } else {
+                    largestRecvApp
+                }
+                var pkt: ParsedPacket
+                try {
+                    pkt = PacketBuilder.openLong(sliceBytes(data, off, pktEnd - off), keys,
+                        largest)
+                } catch (e: Exception) {
+                    lastError = "decrypt failed (space ${space}): ${e}"
+                    printDecryptFailure(space, sliceBytes(data, off, pktEnd - off))
+                    return
+                }
+                recordRecv(space, pkt.pn)
+                handleFrames(space, pkt.payload)
+                off = pktEnd
+            } else {
+                // Trailing zero padding after the coalesced packets is legal; a
+                // QUIC packet always has the fixed bit set (RFC 9000 section 17.2).
+                if ((b0 & 0x40) == 0) {
+                    return
+                }
+                if (appServer.key.size == 0) {
+                    return
+                }
+                let pnOffset = off + 1 + dcid.size
+                if (pnOffset + 4 + 16 > data.size) {
+                    return
+                }
+                var pkt: ParsedPacket
+                try {
+                    pkt = PacketBuilder.openShort(sliceBytes(data, off, data.size - off),
+                        dcid.size, appServer, largestRecvApp)
+                } catch (e: Exception) {
+                    lastError = "decrypt failed (1-rtt): ${e}"
+                    printDecryptFailure(2, sliceBytes(data, off, data.size - off))
+                    return
+                }
+                recordRecv(2, pkt.pn)
+                handleFrames(2, pkt.payload)
+                return
+            }
+        }
+    }
+
+    private func printDecryptFailure(space: Int64, pkt: Array<UInt8>): Unit {
+        if (debug) {
+            let n = if (pkt.size < 40) {
+                pkt.size
+            } else {
+                40
+            }
+            println("DBG decrypt-fail space=${space} len=${pkt.size} hdr=" + hexEncode(sliceBytes(pkt, 0, n)))
+        }
+    }
+
+    private func recordRecv(space: Int64, pn: Int64): Unit {
+        if (space == 0) {
+            if (pn > largestRecvInitial) {
+                largestRecvInitial = pn
+            }
+            recvInitialCount = addPn(recvInitial, recvInitialCount, pn)
+        } else if (space == 1) {
+            if (pn > largestRecvHandshake) {
+                largestRecvHandshake = pn
+            }
+            recvHandshakeCount = addPn(recvHandshake, recvHandshakeCount, pn)
+        } else {
+            if (pn > largestRecvApp) {
+                largestRecvApp = pn
+            }
+            recvAppCount = addPn(recvApp, recvAppCount, pn)
+        }
+    }
+
+    private func addPn(arr: Array<Int64>, count: Int64, pn: Int64): Int64 {
+        var i = 0
+        while (i < count) {
+            if (arr[i] == pn) {
+                return count
+            }
+            i++
+        }
+        var c = count
+        if (c >= arr.size) {
+            var k = 0
+            while (k < arr.size - 1) {
+                arr[k] = arr[k + 1]
+                k++
+            }
+            c = arr.size - 1
+        }
+        arr[c] = pn
+        c++
+        // insertion sort
+        var x = 1
+        while (x < c) {
+            let v = arr[x]
+            var j = x - 1
+            while (j >= 0 && arr[j] > v) {
+                arr[j + 1] = arr[j]
+                j--
+            }
+            arr[j + 1] = v
+            x++
+        }
+        return c
+    }
+
+    // ------------------------------------------------------------------
+
+    private func handleFrames(space: Int64, payload: Array<UInt8>): Unit {
+        let r = ByteReader(payload)
+        var needAck = false
+        while (!r.eof()) {
+            let ftype = Varint.read(r)
+            if (ftype == 0) {
+                continue
+            } else if (ftype == 1) {
+                needAck = true
+            } else if (ftype == 2 || ftype == 3) {
+                handleAck(r, space)
+            } else if (ftype == 6) {
+                needAck = true
+                let off = Int64(Varint.read(r))
+                let len = Int64(Varint.read(r))
+                let data = r.readBytes(len)
+                onCrypto(space, off, data)
+            } else if (ftype >= 8 && ftype <= 15) {
+                needAck = true
+                let sid = Int64(Varint.read(r))
+                var o: Int64 = 0
+                if ((ftype & 0x04) != 0) {
+                    o = Int64(Varint.read(r))
+                }
+                var len: Int64 = -1
+                if ((ftype & 0x02) != 0) {
+                    len = Int64(Varint.read(r))
+                }
+                let fin = (ftype & 0x01) != 0
+                let data = if (len < 0) { r.readBytes(r.remaining()) } else { r.readBytes(len) }
+                onStreamFrame(sid, o, data, fin)
+            } else if (ftype == 0x10) {
+                peerTp.initialMaxData = Varint.read(r)
+            } else if (ftype == 0x11) {
+                let sid = Int64(Varint.read(r))
+                let lim = Int64(Varint.read(r))
+                let st = getStream(sid)
+                if (st.isSome()) {
+                    st.getOrThrow().maxSend = lim
+                }
+            } else if (ftype == 0x18) {
+                let seq = Varint.read(r)
+                let retire = Varint.read(r)
+                let cidLen = Int64(r.readU8())
+                let cid = r.readBytes(cidLen)
+                let token = r.readBytes(16)
+                if (peerCid.size == 0) {
+                    peerCid = cid
+                }
+                dcid = cid
+            } else if (ftype == 0x1c || ftype == 0x1d) {
+                let code = Varint.read(r)
+                closed = true
+                closeReason = "peer closed (code ${code})"
+                if (!r.eof()) {
+                    let flen = Int64(Varint.read(r))
+                    if (flen > 0 && r.remaining() >= flen) {
+                        closeReason = String.fromUtf8(r.readBytes(flen))
+                    }
+                }
+                return
+            } else if (ftype == 0x1e) {
+                handshakeDone = true
+            } else {
+                return
+            }
+        }
+        if (needAck) {
+            sendAck(space)
+        }
+    }
+
+    private func handleAck(r: ByteReader, space: Int64) {
+        let largest = Int64(Varint.read(r))
+        let delay = Int64(Varint.read(r))
+        let rangeCount = Int64(Varint.read(r))
+        var smallest = largest
+        var i = 0
+        while (i < rangeCount) {
+            let gap = Int64(Varint.read(r))
+            let len = Int64(Varint.read(r))
+            smallest = smallest - gap - 2 - len
+            i++
+        }
+        var k = sentCount - 1
+        while (k >= 0) {
+            let p = sent[k]
+            if (p.used && p.space == space && p.pn == largest) {
+                latestRtt = nowMillis() - p.time
+                if (srtt == 0) {
+                    srtt = latestRtt
+                } else {
+                    srtt = (srtt * 7 + latestRtt) / 8
+                }
+                ptoCount = 0
+                break
+            }
+            k--
+        }
+        k = sentCount - 1
+        while (k >= 0) {
+            let p = sent[k]
+            if (p.used && p.space == space && p.pn <= largest && p.pn >= smallest) {
+                p.used = false
+            }
+            k--
+        }
+    }
+
+    private func onCrypto(space: Int64, off: Int64, data: Array<UInt8>): Unit {
+        if (space == 0) {
+            cryptoInInitial.putBytes(data)
+            tls.onData(cryptoInInitial.toArray())
+            cryptoInInitial.clear()
+        } else if (space == 1) {
+            cryptoInHandshake.putBytes(data)
+            tls.onData(cryptoInHandshake.toArray())
+            cryptoInHandshake.clear()
+        } else {
+            tls.onData(data)
+        }
+        if (tls.state == 7) {
+            lastError = tls.failure
+            closed = true
+            return
+        }
+        if (tls.state == 2 && handshakeClient.key.size == 0) {
+            handshakeClient = PacketKeys(tls.clientHs.key, tls.clientHs.iv, tls.clientHs.hp)
+            handshakeServer = PacketKeys(tls.serverHs.key, tls.serverHs.iv, tls.serverHs.hp)
+        }
+        let out = tls.takeOutput()
+        if (out.size > 0) {
+            cryptoHsOut.putBytes(out)
+        }
+        if (tls.handshakeComplete && !established) {
+            appClient = PacketKeys(tls.clientApp.key, tls.clientApp.iv, tls.clientApp.hp)
+            appServer = PacketKeys(tls.serverApp.key, tls.serverApp.iv, tls.serverApp.hp)
+            if (tls.peerParams.size > 0) {
+                peerTp = TransportParams.decode(tls.peerParams)
+                peerAppParams = tls.peerParams
+            }
+            established = true
+            flushCryptoHs()
+        }
+    }
+
+    private func flushCryptoHs(): Unit {
+        if (cryptoHsOut.size == 0) {
+            return
+        }
+        let data = cryptoHsOut.toArray()
+        cryptoHsOut.clear()
+        let w = ByteWriter(data.size + 32)
+        w.putU8(0x06)
+        Varint.write(w, UInt64(cryptoHsOffset))
+        Varint.write(w, UInt64(data.size))
+        w.putBytes(data)
+        cryptoHsOffset = cryptoHsOffset + data.size
+        let pkt = buildLongPacket(1, w.toArray(), 0)
+        sendDatagram(pkt)
+    }
+
+    private func onStreamFrame(id: Int64, off: Int64, data: Array<UInt8>, fin: Bool): Unit {
+        var st: QuicStream
+        let found = getStream(id)
+        if (found.isSome()) {
+            st = found.getOrThrow()
+        } else {
+            st = QuicStream()
+            st.id = id
+            st.maxSend = 1048576
+            putStream(st)
+        }
+        if (off == st.recvOff) {
+            st.recvBuf.putBytes(data)
+            st.recvOff = st.recvOff + data.size
+            var progressed = true
+            while (progressed) {
+                progressed = false
+                var i = 0
+                while (i < st.pendingCount) {
+                    if (st.pendingOff[i] == st.recvOff) {
+                        let seg = st.pending[i]
+                        st.recvBuf.putBytes(seg)
+                        st.recvOff = st.recvOff + seg.size
+                        st.pendingOff[i] = st.pendingOff[st.pendingCount - 1]
+                        st.pending[i] = st.pending[st.pendingCount - 1]
+                        st.pendingCount--
+                        progressed = true
+                        break
+                    }
+                    i++
+                }
+            }
+        } else if (off > st.recvOff && st.pendingCount < st.pending.size) {
+            st.pending[st.pendingCount] = data
+            st.pendingOff[st.pendingCount] = off
+            st.pendingCount++
+        }
+        if (fin) {
+            st.recvFin = true
+            st.recvFinOffset = off + data.size
+        }
+    }
+
+    private func sendAck(space: Int64): Unit {
+        let ack = encodeAck(space)
+        if (ack.size == 0) {
+            return
+        }
+        if (space == 0) {
+            sendDatagram(buildLongPacket(0, ack, 1200))
+        } else if (space == 1) {
+            sendDatagram(buildLongPacket(1, ack, 0))
+        } else {
+            sendDatagram(buildShortPacket(ack))
+        }
+    }
+
+    // ------------------------------------------------------------------
+
+    public var debug: Bool = false
+
+    public func sendClientHello(): Unit {
+        if (debug) {
+            println("DBG peer=" + peer.toString())
+        }
+        let w = ByteWriter(clientHello.size + 32)
+        w.putU8(0x06)
+        Varint.write(w, 0)
+        Varint.write(w, UInt64(clientHello.size))
+        w.putBytes(clientHello)
+        let pkt = buildLongPacket(0, w.toArray(), 1200)
+        if (debug && !dumpedFirstInitial) {
+            dumpedFirstInitial = true
+            println("DBG initial=" + hexEncode(pkt))
+        }
+        sendDatagram(pkt)
+        if (debug) {
+            println("DBG after-send err=" + lastError)
+        }
+    }
+
+    private var dumpedFirstInitial: Bool = false
+
+    public func handshake(timeoutMs: Int64): Bool {
+        sendClientHello()
+        let deadline = nowMillis() + timeoutMs
+        var lastProbe = nowMillis()
+        while (nowMillis() < deadline) {
+            if (closed) {
+                return false
+            }
+            pollOnce()
+            if (established) {
+                return true
+            }
+            if (nowMillis() - lastProbe > 250) {
+                lastProbe = nowMillis()
+                ptoCount++
+                if (ptoCount > 10) {
+                    lastError = if (lastError == "") { "handshake timeout" } else { lastError }
+                    return false
+                }
+                if (!established) {
+                    sendClientHello()
+                }
+                flushCryptoHs()
+            }
+        }
+        lastError = "handshake timeout (tls state ${tls.state}: ${tls.failure})"
+        return false
+    }
+
+    public func openBidiStream(): QuicStream {
+        var id: Int64 = 0
+        while (getStream(id).isSome()) {
+            id = id + 4
+        }
+        let st = QuicStream()
+        st.id = id
+        st.maxSend = Int64(peerTp.initialMaxStreamDataBidiRemote)
+        putStream(st)
+        return st
+    }
+
+    public func putStream(st: QuicStream): Unit {
+        if (streamCount < streamIds.size) {
+            streamIds[streamCount] = st.id
+            streamObjs[streamCount] = st
+            streamCount++
+        }
+    }
+
+    public func getStream(id: Int64): Option<QuicStream> {
+        var i = 0
+        while (i < streamCount) {
+            if (streamIds[i] == id) {
+                return Some(streamObjs[i])
+            }
+            i++
+        }
+        return None
+    }
+
+    public func sendStream(st: QuicStream, data: Array<UInt8>, fin: Bool): Unit {
+        st.sendBuf = concat(st.sendBuf, data)
+        if (fin) {
+            st.finQueued = true
+        }
+        flushStreams()
+    }
+
+    public func flushStreams(): Unit {
+        if (!established) {
+            return
+        }
+        var idx = 0
+        while (idx < streamCount) {
+            let st = streamObjs[idx]
+            idx++
+            while (st.sendOff < st.sendBuf.size) {
+                let avail = st.sendBuf.size - st.sendOff
+                let room = st.maxSend - st.sendOff
+                var n = if (avail < room) { avail } else { room }
+                if (n > 1000) {
+                    n = 1000
+                }
+                if (n <= 0) {
+                    break
+                }
+                let w = ByteWriter(1024)
+                let finFlag = st.finQueued && (st.sendOff + n == st.sendBuf.size)
+                // STREAM frame: LEN always, OFF only when the offset is non-zero
+                // (RFC 9000 section 19.8).
+                var ftype: UInt8 = 0x0A
+                if (finFlag) {
+                    ftype = 0x0B
+                }
+                if (st.sendOff > 0) {
+                    ftype = ftype | 0x04
+                }
+                w.putU8(ftype)
+                Varint.write(w, UInt64(st.id))
+                if (st.sendOff > 0) {
+                    Varint.write(w, UInt64(st.sendOff))
+                }
+                Varint.write(w, UInt64(n))
+                w.putBytes(st.sendBuf, st.sendOff, n)
+                sendDatagram(buildShortPacket(w.toArray()))
+                st.sendOff = st.sendOff + n
+            }
+        }
+    }
+
+    public func closeConnection(reason: String): Unit {
+        if (closed) {
+            return
+        }
+        closed = true
+        closeReason = reason
+        try {
+            let w = ByteWriter(64)
+            w.putU8(0x1c)
+            Varint.write(w, 0)
+            let msg = reason.toArray()
+            Varint.write(w, UInt64(msg.size))
+            w.putBytes(msg)
+            sendDatagram(buildShortPacket(w.toArray()))
+        } catch (e: Exception) {
+            // ignore
+        }
+    }
+}
+
+public func nowMillis(): Int64 {
+    return DateTime.now().toUnixTimeStamp().toMilliseconds()
+}

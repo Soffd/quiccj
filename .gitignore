@@ -1,0 +1,20 @@
+# cjpm / Cangjie build output
+target/
+*.cjo
+*.bc
+*.a
+.cjpm/
+
+# Logs
+*.log
+
+# Local test TLS material (self-signed; regenerate with interop/gen_cert.sh)
+interop/key.pem
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS
+.DS_Store
+*.swp
