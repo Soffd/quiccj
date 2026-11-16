@@ -208,14 +208,37 @@ public class EcCurve {
         return Some(pt)
     }
 
+    public func decodePoint(encoded: Array<UInt8>): EcPoint {
+        if (encoded.size != 1 + 2 * byteLen || encoded[0] != 4) {
+            throw Exception("invalid EC point encoding")
+        }
+        let x = BigUint.fromBytesBE(sliceBytes(encoded, 1, byteLen), limbs)
+        let y = BigUint.fromBytesBE(sliceBytes(encoded, 1 + byteLen, byteLen), limbs)
+        if (x.cmp(pPlain) >= 0 || y.cmp(pPlain) >= 0) {
+            throw Exception("EC coordinate out of range")
+        }
+        let point = EcPoint(limbs)
+        point.x = p.toMont(x)
+        point.y = p.toMont(y)
+        point.z = p.one()
+        point.infinity = false
+        let x3 = p.mul(point.x, p.mul(point.x, point.x))
+        let rhs = p.add(p.add(x3, p.mul(aMont, point.x)), b)
+        if (p.mul(point.y, point.y).cmp(rhs) != 0) {
+            throw Exception("point is not on the curve")
+        }
+        return point
+    }
+
     /** Verify ECDSA over this curve. `spki` is the uncompressed SEC1 point. */
     public func verify(spki: Array<UInt8>, hash: Array<UInt8>, rBytes: Array<UInt8>,
         sBytes: Array<UInt8>): Bool {
-        if (spki.size != 2 * byteLen + 1 || spki[0] != 4) {
+        if (rBytes.size > byteLen || sBytes.size > byteLen) {
             return false
         }
-        let q = decompress(sliceBytes(spki, 1, byteLen), (spki[2 * byteLen] & 1) == 1)
-        if (q.isNone()) {
+        let q = try {
+            decodePoint(spki)
+        } catch (e: Exception) {
             return false
         }
         let rPlain = BigUint.fromBytesBE(rBytes, limbs)
@@ -240,7 +263,7 @@ public class EcCurve {
         let u1 = n.fromMont(n.mul(n.toMont(e), n.toMont(w)))
         let u2 = n.fromMont(n.mul(n.toMont(rPlain), n.toMont(w)))
         let p1 = mul(generator(), u1.toBytesBE(byteLen))
-        let p2 = mul(q.getOrThrow(), u2.toBytesBE(byteLen))
+        let p2 = mul(q, u2.toBytesBE(byteLen))
         let sum = add(p1, p2)
         if (sum.infinity) {
             return false

@@ -1,0 +1,9 @@
+[package]
+  cjc-version = "1.2.1"
+  name = "quic_openssl"
+  version = "0.1.0"
+  description = "Optional OpenSSL 3 cryptography backend for quiccj"
+  output-type = "static"
+
+[dependencies]
+  quic = { path = "../quic" }

@@ -62,10 +62,8 @@ public func concat3(a: Array<UInt8>, b: Array<UInt8>, c: Array<UInt8>): Array<UI
 
 public func copyBytes(dst: Array<UInt8>, dstOff: Int64, src: Array<UInt8>, srcOff: Int64,
     len: Int64): Unit {
-    var i = 0
-    while (i < len) {
-        dst[dstOff + i] = src[srcOff + i]
-        i++
+    if (len != 0) {
+        src.copyTo(dst, srcOff, dstOff, len)
     }
 }
 

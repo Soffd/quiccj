@@ -6,17 +6,51 @@ import std.fs.*
 
 @Test
 class X509Test {
-    static func readText(path: String): String {
-        let f = File(path, OpenMode.Read)
-        let buf = Array<UInt8>(65536, repeat: 0)
-        let n = f.read(buf)
-        f.close()
-        return String.fromUtf8(sliceBytes(buf, 0, n))
+    @TestCase
+    func strictDerObjectIds() {
+        @Expect(Der.parse(hexDecode("0603883703")).readOid(), "2.999.3")
+        @Expect(oidRejected(hexDecode("06022a80")), true)
+        @Expect(oidRejected(hexDecode("06032a8001")), true)
+        @Expect(oidRejected(hexDecode("060b2a81808080808080808000")), true)
+    }
+
+    @TestCase
+    func strictCertificateTime() {
+        @Expect(readUtcTime("500101000000Z"), -631152000)
+        @Expect(readUtcTime("700101000000Z"), 0)
+        @Expect(timeRejected("230229120000Z"), true)
+        @Expect(timeRejected("241301000000Z"), true)
+        @Expect(timeRejected("240101240000Z"), true)
+        @Expect(timeRejected("240101000000+0000"), true)
+        @Expect(timeRejected("2401010000Z"), true)
+    }
+
+    private func oidRejected(bytes: Array<UInt8>): Bool {
+        try {
+            Der.parse(bytes).readOid()
+            return false
+        } catch (e: Exception) {
+            return true
+        }
+    }
+
+    private func readUtcTime(time: String): Int64 {
+        let raw = time.toArray()
+        return Der.parse(concat([0x17, UInt8(raw.size)], raw)).readTime()
+    }
+
+    private func timeRejected(time: String): Bool {
+        try {
+            readUtcTime(time)
+            return false
+        } catch (e: Exception) {
+            return true
+        }
     }
 
     @TestCase
     func parseCloudflareChain() {
-        let pem = readText("testdata/chain.pem")
+        let pem = String.fromUtf8(File.readFrom("testdata/chain.pem"))
         let blocks = pemCertificates(pem)
         @Expect(blocks.size, 3)
         let leaf = X509Cert.parse(blocks[0])
@@ -35,8 +69,7 @@ class X509Test {
 
     @TestCase
     func verifyCloudflareChain() {
-        let chainPem = readText("testdata/chain.pem")
-        let rootsPem = readText("testdata/roots.pem")
+        let chainPem = String.fromUtf8(File.readFrom("testdata/chain.pem"))
         let blocks = pemCertificates(chainPem)
         let chain = Array<X509Cert>(8, repeat: X509Cert())
         var i = 0
@@ -44,8 +77,7 @@ class X509Test {
             chain[i] = X509Cert.parse(blocks[i])
             i++
         }
-        let store = TrustStore()
-        store.addPem(rootsPem)
+        let store = TrustStore.fromFile("testdata/roots.pem")
         @Expect(store.count, 5)
         // 2026-11-15
         let ok = verifyCertificateChain(chain, blocks.size, store, "cloudflare-quic.com", 1794773559)

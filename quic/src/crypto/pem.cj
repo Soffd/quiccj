@@ -1,5 +1,7 @@
 package quic.crypto
 
+import std.collection.ArrayList
+
 /*
  * PEM (RFC 7468) decoding, byte-oriented so PEM offsets are never confused
  * with character indices.
@@ -98,13 +100,11 @@ private func matchAt(data: Array<UInt8>, off: Int64, pat: Array<UInt8>): Bool {
 /** Extract all CERTIFICATE blocks from a PEM bundle. */
 public func pemCertificates(text: String): Array<Array<UInt8>> {
     let raw = text.toArray()
-    let slots = 64
-    let out = Array<Array<UInt8>>(slots, repeat: Array<UInt8>(0, repeat: 0))
-    var count = 0
+    let out = ArrayList<Array<UInt8>>()
     let begin = "-----BEGIN CERTIFICATE-----".toArray()
     let endMark = "-----END CERTIFICATE-----".toArray()
     var i = 0
-    while (i + begin.size <= raw.size && count < slots) {
+    while (i + begin.size <= raw.size) {
         if (matchAt(raw, i, begin)) {
             var j = i + begin.size
             var e = -1
@@ -119,18 +119,11 @@ public func pemCertificates(text: String): Array<Array<UInt8>> {
                 break
             }
             let b64 = String.fromUtf8(sliceBytes(raw, i + begin.size, e - (i + begin.size)))
-            out[count] = base64Decode(b64)
-            count++
+            out.add(base64Decode(b64))
             i = e + endMark.size
         } else {
             i++
         }
     }
-    let result = Array<Array<UInt8>>(count, repeat: Array<UInt8>(0, repeat: 0))
-    var k = 0
-    while (k < count) {
-        result[k] = out[k]
-        k++
-    }
-    return result
+    return out.toArray()
 }

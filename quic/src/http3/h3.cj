@@ -2,11 +2,11 @@ package quic.http3
 
 import quic.crypto.*
 import quic.transport.*
+import std.collection.*
 
 /*
- * Minimal HTTP/3 (RFC 9114) client with QPACK (RFC 9204).
- * Encoder uses the static table and literals only (never blocks).
- * Decoder supports the static table, literals and dynamic-table inserts.
+ * HTTP/3 (RFC 9114) client with QPACK (RFC 9204).
+ * The encoder uses the peer's SETTINGS to bound potentially blocked sections.
  */
 
 public let QPACK_STATIC: Array<String> = [
@@ -34,7 +34,7 @@ public let QPACK_STATIC: Array<String> = [
     ":status", "100", ":status", "204", ":status", "206",
     ":status", "302", ":status", "400", ":status", "403",
     ":status", "421", ":status", "425", ":status", "500",
-    ":status", "502", "accept-language", "", "access-control-allow-credentials", "FALSE",
+    "accept-language", "", "access-control-allow-credentials", "FALSE",
     "access-control-allow-credentials", "TRUE", "access-control-allow-headers", "*", "access-control-allow-methods", "get",
     "access-control-allow-methods", "get, post, options", "access-control-allow-methods", "options", "access-control-expose-headers", "content-length",
     "access-control-request-headers", "content-type", "access-control-request-method", "get", "access-control-request-method", "post",
@@ -43,6 +43,7 @@ public let QPACK_STATIC: Array<String> = [
     "if-range", "", "origin", "", "purpose", "prefetch",
     "server", "", "timing-allow-origin", "*", "upgrade-insecure-requests", "1",
     "user-agent", "", "x-forwarded-for", "", "x-frame-options", "deny",
+    "x-frame-options", "sameorigin",
 ]
 
 public class H3Header {
@@ -63,17 +64,21 @@ private func staticIndex(name: String, value: String): Int64 {
 }
 
 public func qpackEncode(headers: Array<H3Header>): Array<UInt8> {
+    return encodeFields(headers, 0, "")
+}
+
+func encodeFields(headers: Array<H3Header>, encodedInsertCount: Int64, authority: String): Array<UInt8> {
     let w = ByteWriter(256)
-    // Field section prefix: Required Insert Count = 0, Delta Base = 0 (RFC 9204
-    // section 4.5.1); a static-table-only block never blocks the decoder.
-    w.putU8(0)
+    putPrefixed(w, 0, 8, encodedInsertCount)
     w.putU8(0)
     var i = 0
     while (i < headers.size) {
         let name = headers[i].name
         let value = headers[i].value
         let idx = staticIndex(name, value)
-        if (idx >= 0 && idx < 63) {
+        if (encodedInsertCount != 0 && name == ":authority" && value == authority) {
+            putPrefixed(w, 0x80, 6, 0)
+        } else if (idx >= 0) {
             // Indexed field line, static table.
             putPrefixed(w, 0xC0, 6, idx)
         } else {
@@ -92,7 +97,7 @@ public func qpackEncode(headers: Array<H3Header>): Array<UInt8> {
 }
 
 /** QPACK/HPACK prefixed integer (RFC 9204 section 4.1.1). */
-private func putPrefixed(w: ByteWriter, pattern: UInt8, prefixBits: Int64, value: Int64): Unit {
+func putPrefixed(w: ByteWriter, pattern: UInt8, prefixBits: Int64, value: Int64): Unit {
     let max = (1 << prefixBits) - 1
     if (value < max) {
         w.putU8(pattern | UInt8(value))
@@ -108,7 +113,7 @@ private func putPrefixed(w: ByteWriter, pattern: UInt8, prefixBits: Int64, value
 }
 
 /** Decode a prefixed integer and consume its continuation groups. */
-private func readPrefixed(r: ByteReader, first: UInt8, prefixBits: Int64): Int64 {
+func readPrefixed(r: ByteReader, first: UInt8, prefixBits: Int64): Int64 {
     let max = (1 << prefixBits) - 1
     var v = Int64(first & UInt8(max))
     if (v < max) {
@@ -117,8 +122,12 @@ private func readPrefixed(r: ByteReader, first: UInt8, prefixBits: Int64): Int64
     var shift = 0
     while (true) {
         let b = r.readU8()
-        v = v + (Int64(b & 0x7F) << shift)
-        shift = shift + 7
+        let chunk = Int64(b & 0x7f)
+        if (shift >= 63 || chunk > ((0x3fff_ffff_ffff_ffff - v) >> shift)) {
+            throw Exception("QPACK integer overflow")
+        }
+        v += chunk << shift
+        shift += 7
         if ((b & 0x80) == 0) {
             break
         }
@@ -126,163 +135,161 @@ private func readPrefixed(r: ByteReader, first: UInt8, prefixBits: Int64): Int64
     return v
 }
 
-/** Decode one QPACK header block (static + literals + dynamic inserts). */
+/** Decode one QPACK field section with externally supplied entries in insertion order. */
 public func qpackDecode(block: Array<UInt8>, dyn: Array<H3Header>, dynCount: Int64): Array<H3Header> {
-    let out = Array<H3Header>(32, repeat: H3Header())
-    var outCount = 0
+    return decodeFields(block, dyn.size, dynCount, { index =>
+        if (index < 0 || index >= dynCount || index >= dyn.size) {
+            throw Exception("QPACK dynamic entry unavailable")
+        }
+        dyn[index]
+    })[0]
+}
+
+func staticHeader(index: Int64): H3Header {
+    if (index < 0 || index >= QPACK_STATIC.size / 2) {
+        throw Exception("QPACK static index out of range")
+    }
+    let field = H3Header()
+    field.name = QPACK_STATIC[2 * index]
+    field.value = QPACK_STATIC[2 * index + 1]
+    return field
+}
+
+func decodeFields(block: Array<UInt8>, maxEntries: Int64, inserts: Int64,
+    lookup: (Int64) -> H3Header): (Array<H3Header>, Int64) {
     let r = ByteReader(block)
-    // Skip the field section prefix (Required Insert Count, Delta Base).
-    let ricFirst = r.readU8()
-    readPrefixed(r, ricFirst, 8)
-    if (!r.eof()) {
-        let baseFirst = r.readU8()
-        readPrefixed(r, baseFirst, 7)
+    let encoded = readPrefixed(r, r.readU8(), 8)
+    var required = 0
+    if (encoded != 0) {
+        let range = 2 * maxEntries
+        if (encoded > range) {
+            throw Exception("invalid QPACK required insert count")
+        }
+        let maxValue = inserts + maxEntries
+        required = (maxValue / range) * range + encoded - 1
+        if (required > maxValue) {
+            required -= range
+        }
+        if (required <= 0 || required > inserts) {
+            throw Exception("unavailable QPACK insert count")
+        }
     }
+    let deltaField = r.readU8()
+    let delta = readPrefixed(r, deltaField, 7)
+    let base = if ((deltaField & 0x80) != 0) { required - delta - 1 } else { required + delta }
+    if (base < 0) {
+        throw Exception("invalid QPACK base")
+    }
+    let requiredCount = required
+    let dynamic = { index: Int64 =>
+        if (index < 0 || index >= requiredCount) {
+            throw Exception("QPACK index exceeds required insert count")
+        }
+        lookup(index)
+    }
+    let out = ArrayList<H3Header>()
     while (!r.eof()) {
-        let b = r.readU8()
-        var name = ""
-        var value = ""
-        if ((b & 0x80) != 0) {
-            // indexed field line
-            let staticRef = (b & 0x40) != 0
-            var index = Int64(b & 0x3F)
-            if ((b & 0x3F) == 0x3F) {
-                index = index + Int64(Varint.read(r))
+        let first = r.readU8()
+        let field = H3Header()
+        if ((first & 0x80) != 0) {
+            let index = readPrefixed(r, first, 6)
+            let entry = if ((first & 0x40) != 0) { staticHeader(index) } else {
+                dynamic(base - index - 1)
             }
-            if (staticRef) {
-                if (index * 2 + 1 < QPACK_STATIC.size) {
-                    name = QPACK_STATIC[index * 2]
-                    value = QPACK_STATIC[index * 2 + 1]
-                }
-            } else {
-                let pos = Int64(index)
-                if (pos < dynCount) {
-                    name = dyn[pos].name
-                    value = dyn[pos].value
-                }
+            field.name = entry.name
+            field.value = entry.value
+        } else if ((first & 0x40) != 0) {
+            let index = readPrefixed(r, first, 4)
+            let entry = if ((first & 0x10) != 0) { staticHeader(index) } else {
+                dynamic(base - index - 1)
             }
-        } else if ((b & 0xC0) == 0x40) {
-            // literal with name reference
-            let staticRef = (b & 0x10) != 0
-            var index = Int64(b & 0x0F)
-            if ((b & 0x0F) == 0x0F) {
-                index = index + Int64(Varint.read(r))
-            }
-            if (staticRef) {
-                if (index * 2 < QPACK_STATIC.size) {
-                    name = QPACK_STATIC[index * 2]
-                }
-            } else {
-                let pos = Int64(index)
-                if (pos < dynCount) {
-                    name = dyn[pos].name
-                }
-            }
-            value = decodeString(r)
-        } else if ((b & 0xE0) == 0x20) {
-            // literal with literal name: 001 N H NameLen(3+), Name, Value
-            let nameLen = readPrefixed(r, b, 3)
-            name = String.fromUtf8(r.readBytes(nameLen))
-            value = decodeString(r)
+            field.name = entry.name
+            field.value = decodeString(r)
+        } else if ((first & 0x20) != 0) {
+            let length = readPrefixed(r, first, 3)
+            field.name = decodeText(r.readBytes(length), (first & 0x08) != 0)
+            field.value = decodeString(r)
+        } else if ((first & 0x10) != 0) {
+            let entry = dynamic(base + readPrefixed(r, first, 4))
+            field.name = entry.name
+            field.value = entry.value
         } else {
-            // unsupported (post-base / dynamic inserts on request stream): stop
-            break
+            field.name = dynamic(base + readPrefixed(r, first, 3)).name
+            field.value = decodeString(r)
         }
-        if (outCount < out.size) {
-            let h = H3Header()
-            h.name = name
-            h.value = value
-            out[outCount] = h
-            outCount++
+        if (field.name == "") {
+            throw Exception("empty QPACK field name")
         }
+        out.add(field)
     }
-    let res = Array<H3Header>(outCount, repeat: H3Header())
-    var i = 0
-    while (i < outCount) {
-        res[i] = out[i]
-        i++
-    }
-    return res
+    return (out.toArray(), required)
 }
 
-private func decodeString(r: ByteReader): String {
+func decodeString(r: ByteReader): String {
     let h = r.readU8()
-    let isHuffman = (h & 0x80) != 0
-    var len = Int64(h & 0x7F)
-    if (len == 0x7F) {
-        len = len + Int64(Varint.read(r))
-    }
-    let raw = r.readBytes(len)
-    if (isHuffman) {
-        return String.fromUtf8(huffmanDecode(raw))
-    }
-    return String.fromUtf8(raw)
+    let length = readPrefixed(r, h, 7)
+    return decodeText(r.readBytes(length), (h & 0x80) != 0)
 }
 
-/** RFC 7541 Huffman decode (canonical codes reconstructed from lengths). */
-public func huffmanDecode(data: Array<UInt8>): Array<UInt8> {
-    let maxLen = 30
-    let count = Array<Int64>(maxLen + 1, repeat: 0)
-    var i = 0
-    while (i < 257) {
-        count[Int64(HUFF_LENS[i])]++
-        i++
-    }
-    let firstCode = Array<Int64>(maxLen + 1, repeat: 0)
-    let firstIndex = Array<Int64>(maxLen + 1, repeat: 0)
-    var code: Int64 = 0
-    var idx: Int64 = 0
-    var len = 1
-    while (len <= maxLen) {
-        code = (code + count[len - 1]) << 1
-        firstCode[len] = code
-        firstIndex[len] = idx
-        idx = idx + count[len]
-        len++
-    }
-    // symbols ordered by (length, symbol)
-    let order = Array<Int64>(257, repeat: 0)
-    var placed = 0
-    var l = 1
-    while (l <= maxLen) {
-        var sym = 0
-        while (sym < 257) {
-            if (Int64(HUFF_LENS[sym]) == l) {
-                order[placed] = sym
-                placed++
-            }
-            sym++
-        }
-        l++
-    }
-    let out = ByteWriter(data.size * 2 + 8)
-    var cur: Int64 = 0
-    var curLen: Int64 = 0
-    var bi = 0
-    while (bi < data.size) {
-        let byte = data[bi]
-        var bit = 7
+func decodeText(raw: Array<UInt8>, huffman: Bool): String {
+    return String.fromUtf8(if (huffman) { huffmanDecode(raw) } else { raw })
+}
+
+private class HuffmanNode {
+    var symbol: Int64 = -1
+    let child = Array<Int64>(2, repeat: -1)
+}
+
+private func huffmanTree(): Array<HuffmanNode> {
+    let nodes = ArrayList<HuffmanNode>()
+    nodes.add(HuffmanNode())
+    for (symbol in 0..HUFF_LENS.size) {
+        let code = HUFF_CODES[symbol]
+        var bit = Int64(HUFF_LENS[symbol]) - 1
+        var node = 0
         while (bit >= 0) {
-            cur = (cur << 1) | Int64((byte >> UInt8(bit)) & 1)
-            curLen++
-            if (curLen <= maxLen && count[curLen] > 0) {
-                let delta = cur - firstCode[curLen]
-                if (delta >= 0 && delta < count[curLen]) {
-                    let sym = order[firstIndex[curLen] + delta]
-                    if (sym == 256) {
-                        return out.toArray()
-                    }
-                    out.putU8(UInt8(sym))
-                    cur = 0
-                    curLen = 0
-                }
+            let branch = (code >> bit) & 1
+            if (nodes[node].child[branch] < 0) {
+                nodes[node].child[branch] = nodes.size
+                nodes.add(HuffmanNode())
             }
-            if (curLen > maxLen) {
-                return out.toArray()
-            }
+            node = nodes[node].child[branch]
             bit--
         }
-        bi++
+        nodes[node].symbol = symbol
+    }
+    return nodes.toArray()
+}
+
+private let HUFFMAN = huffmanTree()
+
+/** RFC 7541 Appendix B, including EOS and padding validation. */
+public func huffmanDecode(data: Array<UInt8>): Array<UInt8> {
+    let out = ByteWriter(data.size + 8)
+    var node = 0
+    var pending = 0
+    var ones = true
+    for (byte in data) {
+        var shift = 7
+        while (shift >= 0) {
+            let bit = Int64((byte >> shift) & 1)
+            node = HUFFMAN[node].child[bit]
+            pending++
+            ones = ones && bit == 1
+            if (node < 0 || HUFFMAN[node].symbol == 256) {
+                throw Exception("invalid QPACK Huffman code")
+            }
+            if (HUFFMAN[node].symbol >= 0) {
+                out.putU8(UInt8(HUFFMAN[node].symbol))
+                node = 0
+                pending = 0
+                ones = true
+            }
+            shift--
+        }
+    }
+    if (pending > 7 || !ones) {
+        throw Exception("invalid QPACK Huffman padding")
     }
     return out.toArray()
 }
@@ -296,6 +303,14 @@ public class H3Frame {
     public static let PUSH_PROMISE: Int64 = 0x05
     public static let GOAWAY: Int64 = 0x07
     public static let MAX_PUSH_ID: Int64 = 0x0D
+
+    public let ftype: Int64
+    public let payload: Array<UInt8>
+
+    public init(ftype: Int64, payload: Array<UInt8>) {
+        this.ftype = ftype
+        this.payload = payload
+    }
 
     public static func encode(ftype: Int64, payload: Array<UInt8>): Array<UInt8> {
         let w = ByteWriter(payload.size + 16)
@@ -312,6 +327,37 @@ public class HttpResponse {
     public var headerCount: Int64 = 0
     public var body: Array<UInt8> = Array<UInt8>(0, repeat: 0)
     public var complete: Bool = false
+    /** The peer's GOAWAY excludes this request. It can be retried on a new connection. */
+    public var rejected: Bool = false
+}
+
+public class Http3Push {
+    public let id: Int64
+    public var promisedHeaders: Array<H3Header> = []
+    let reader = ResponseReader()
+
+    init(id: Int64) {
+        this.id = id
+    }
+
+    public prop response: HttpResponse {
+        get() { reader.response }
+    }
+}
+
+class ResponseReader {
+    let response = HttpResponse()
+    let body = ByteWriter(4096)
+    var offset: Int64 = 0
+    var lastSize: Int64 = -1
+    var trailersSeen = false
+}
+
+private class PeerStream {
+    var typeId: Int64 = -1
+    var offset: Int64 = 0
+    var lastSize: Int64 = -1
+    var pushId: Int64 = -1
 }
 
 public class Http3Client {
@@ -320,24 +366,41 @@ public class Http3Client {
     private var controlStream: QuicStream
     private var encoderStream: QuicStream
     private var decoderStream: QuicStream
-    private var dynTable: Array<H3Header>
-    private var dynCount: Int64
-    private var settingsSent: Bool
+    private let qpack = QpackDecoder()
+    private let peerStreams = HashMap<Int64, PeerStream>()
+    private let pushes = HashMap<Int64, Http3Push>()
+    private let outstandingSections = HashMap<Int64, Bool>()
+    private var controlId: Int64 = -1
+    private var encoderId: Int64 = -1
+    private var decoderId: Int64 = -1
+    private var settingsSent = false
+    private var settingsRead = false
+    private var maxPushId: Int64 = -1
+    private var authorityInserted = false
+    private var authorityAcknowledged = false
+    private var peerBlockedStreams: Int64 = 0
 
-    public init(conn: QuicConnection) {
+    public prop qpackKnownReceivedCount: Int64 {
+        get() { if (authorityAcknowledged) { 1 } else { 0 } }
+    }
+    private let maxResponseBytes: Int64
+    public var goawayId: Option<Int64> = None
+
+    public init(conn: QuicConnection, maxResponseBytes!: Int64 = 16777216) {
+        if (maxResponseBytes < 1) {
+            throw Exception("HTTP/3 response limit must be positive")
+        }
+        this.maxResponseBytes = maxResponseBytes
         this.conn = conn
         this.host = conn.host
         controlStream = QuicStream()
         encoderStream = QuicStream()
         decoderStream = QuicStream()
-        dynTable = Array<H3Header>(64, repeat: H3Header())
-        dynCount = 0
-        settingsSent = false
     }
 
     public static func connect(host: String, port: UInt16, store: TrustStore,
-        verifyPeer: Bool, timeoutMs: Int64): Option<Http3Client> {
-        let conn = QuicConnection.dial(host, port, store, verifyPeer)
+        verifyPeer: Bool, timeoutMs: Int64, backend!: CryptoBackend = PURE_CRYPTO): Option<Http3Client> {
+        let conn = QuicConnection.dial(host, port, store, verifyPeer, backend: backend)
         if (!conn.handshake(timeoutMs)) {
             return None
         }
@@ -347,40 +410,54 @@ public class Http3Client {
     }
 
     public func openControlStreams(): Unit {
-        // client-initiated unidirectional stream ids: 2, 6, 10, ...
-        let ctrl = QuicStream()
-        ctrl.id = 2
-        conn.putStream(ctrl)
-        let settings = ByteWriter(8)
-        settings.putU8(0x00) // control stream type
-        Varint.write(settings, 0x04)
-        Varint.write(settings, 0)
-        conn.sendStream(ctrl, settings.toArray(), false)
-        controlStream = ctrl
-
-        let enc = QuicStream()
-        enc.id = 6
-        conn.putStream(enc)
-        conn.sendStream(enc, [0x02], false)
-        encoderStream = enc
-
-        let dec = QuicStream()
-        dec.id = 10
-        conn.putStream(dec)
-        conn.sendStream(dec, [0x03], false)
-        decoderStream = dec
+        if (settingsSent) {
+            return
+        }
+        controlStream = conn.openUniStream()
+        encoderStream = conn.openUniStream()
+        decoderStream = conn.openUniStream()
+        let settings = ByteWriter(16)
+        Varint.write(settings, 1) // QPACK_MAX_TABLE_CAPACITY
+        Varint.write(settings, UInt64(DECODER_CAPACITY))
+        writeStream(controlStream, concat([0], H3Frame.encode(H3Frame.SETTINGS, settings.toArray())), false)
+        writeStream(encoderStream, [2], false)
+        writeStream(decoderStream, [3], false)
         settingsSent = true
     }
 
-    public func get(path: String): HttpResponse {
-        let req = QuicStream()
-        var id: Int64 = 0
-        while (conn.getStream(id).isSome()) {
-            id = id + 4
+    private func writeStream(stream: QuicStream, data: Array<UInt8>, fin: Bool): Unit {
+        if (conn.established) {
+            conn.sendStream(stream, data, fin)
+        } else {
+            conn.sendEarlyStream(stream, data, fin)
         }
-        req.id = id
-        req.maxSend = 1048576
-        conn.putStream(req)
+    }
+
+    /** Send an explicitly replay-safe GET, using 0-RTT when the session allows it. */
+    public func getEarly(path: String, handshakeTimeoutMs!: Int64 = 8000): HttpResponse {
+        if (!conn.canSendEarlyData && !conn.handshake(handshakeTimeoutMs)) {
+            return HttpResponse()
+        }
+        let request = sendGet(path)
+        if (!conn.handshake(handshakeTimeoutMs)) {
+            return HttpResponse()
+        }
+        return waitResponse(request)
+    }
+
+    public func get(path: String): HttpResponse {
+        openControlStreams()
+        if (goawayId.isSome()) {
+            let rejected = HttpResponse()
+            rejected.rejected = true
+            return rejected
+        }
+        return waitResponse(sendGet(path))
+    }
+
+    private func sendGet(path: String): QuicStream {
+        openControlStreams()
+        let req = conn.openBidiStream()
         let headers = Array<H3Header>(8, repeat: H3Header())
         let h1 = H3Header()
         h1.name = ":method"
@@ -392,90 +469,403 @@ public class Http3Client {
         headers[1] = h2
         let h3 = H3Header()
         h3.name = ":authority"
-        h3.value = host
+        h3.value = if (conn.port == 443) { host } else { "${host}:${conn.port}" }
         headers[2] = h3
         let h4 = H3Header()
         h4.name = ":path"
         h4.value = path
         headers[3] = h4
-        let block = qpackEncode(headers[0..4])
+        let block = if (authorityInserted &&
+            (authorityAcknowledged || outstandingSections.size < peerBlockedStreams)) {
+            outstandingSections.add(req.id, true)
+            // One insertion at absolute index 0: encoded count 2, base 1.
+            encodeFields(headers[0..4], 2, authority())
+        } else {
+            qpackEncode(headers[0..4])
+        }
         var frame = H3Frame.encode(H3Frame.HEADERS, block)
-        conn.sendStream(req, frame, true)
-        conn.flushStreams()
-        return waitResponse(req)
+        writeStream(req, frame, true)
+        return req
+    }
+
+    private func authority(): String {
+        let name = if (host.contains(":")) { "[" + host + "]" } else { host }
+        return if (conn.port == 443) { name } else { "${name}:${conn.port}" }
+    }
+
+    /** Permit push IDs up to and including the given ID. Push is opt-in. */
+    public func allowPush(maxId: Int64): Unit {
+        if (maxId < 0 || maxId > 15 || maxId < maxPushId) {
+            throw Exception("push ID must be nondecreasing and in 0..15")
+        }
+        openControlStreams()
+        maxPushId = maxId
+        let id = ByteWriter(8)
+        Varint.write(id, UInt64(maxId))
+        conn.sendStream(controlStream, H3Frame.encode(H3Frame.MAX_PUSH_ID, id.toArray()), false)
+    }
+
+    public func getPush(id: Int64): Option<Http3Push> {
+        let push = pushes.get(id)
+        if (let Some(value) <- push) {
+            if (value.promisedHeaders.size > 0) {
+                return push
+            }
+        }
+        return None
+    }
+
+    public func pollOnce(): Bool {
+        let received = conn.pollOnce()
+        if (conn.closed) {
+            return received
+        }
+        try {
+            for (stream in conn.peerUniStreams()) {
+                processPeerStream(stream)
+            }
+        } catch (e: Exception) {
+            fail(0x101, e.message)
+        }
+        return received
+    }
+
+    private func processPeerStream(stream: QuicStream): Unit {
+        let state = if (let Some(existing) <- peerStreams.get(stream.id)) { existing } else {
+            let created = PeerStream()
+            peerStreams.add(stream.id, created)
+            created
+        }
+        if (state.pushId >= 0 && pushFor(state.pushId).response.complete) {
+            return
+        }
+        if (stream.receiveReset.isSome() && (state.typeId == 0 || state.typeId == 2 || state.typeId == 3)) {
+            fail(0x104, "HTTP/3 critical stream reset")
+            return
+        }
+        if (state.lastSize == stream.recvBuf.size && !stream.recvFin) {
+            return
+        }
+        if (stream.recvBuf.size > maxResponseBytes) {
+            throw Exception("HTTP/3 unidirectional stream limit exceeded")
+        }
+        state.lastSize = stream.recvBuf.size
+        let r = stream.recvBuf.reader(offset: state.offset)
+        if (state.typeId < 0) {
+            if (!hasVarint(r)) {
+                return
+            }
+            state.typeId = Int64(Varint.read(r))
+            state.offset = r.pos
+            match (state.typeId) {
+                case 0 =>
+                    if (controlId >= 0) { throw Exception("duplicate control stream") }
+                    controlId = stream.id
+                case 2 =>
+                    if (encoderId >= 0) { throw Exception("duplicate QPACK encoder stream") }
+                    encoderId = stream.id
+                case 3 =>
+                    if (decoderId >= 0) { throw Exception("duplicate QPACK decoder stream") }
+                    decoderId = stream.id
+                case _ => ()
+            }
+        }
+        match (state.typeId) {
+            case 0 =>
+                while (!r.eof()) {
+                    if (let Some(frame) <- readFrame(r)) {
+                        onControl(frame)
+                        state.offset = r.pos
+                    } else {
+                        break
+                    }
+                }
+            case 1 =>
+                if (state.pushId < 0) {
+                    if (!hasVarint(r)) { return }
+                    state.pushId = Int64(Varint.read(r))
+                    let push = pushFor(state.pushId)
+                    if (push.reader.offset != 0) { throw Exception("duplicate push stream") }
+                    push.reader.offset = r.pos
+                }
+                readResponse(stream, pushFor(state.pushId).reader, false)
+            case 2 =>
+                let previous = qpack.inserts
+                while (!r.eof()) {
+                    try {
+                        qpack.instruction(r)
+                        state.offset = r.pos
+                    } catch (e: Exception) {
+                        if (e.message != "buffer underflow") { throw e }
+                        break
+                    }
+                }
+                if (qpack.inserts > previous) {
+                    let increment = ByteWriter(8)
+                    putPrefixed(increment, 0, 6, qpack.inserts - previous)
+                    conn.sendStream(decoderStream, increment.toArray(), false)
+                }
+            case 3 =>
+                while (!r.eof()) {
+                    try {
+                        onDecoderInstruction(r)
+                        state.offset = r.pos
+                    } catch (e: Exception) {
+                        if (e.message != "buffer underflow") { throw e }
+                        break
+                    }
+                }
+            case _ => state.offset = r.end
+        }
+        if (stream.recvFin && (state.typeId == 0 || state.typeId == 2 || state.typeId == 3)) {
+            fail(0x104, "HTTP/3 critical stream closed")
+        } else if (!conn.closed) {
+            conn.extendReceiveWindow(stream, stream.recvOff)
+        }
+    }
+
+    private func onControl(frame: H3Frame): Unit {
+        if (!settingsRead && frame.ftype != H3Frame.SETTINGS) {
+            throw Exception("first HTTP/3 control frame must be SETTINGS")
+        }
+        let r = ByteReader(frame.payload)
+        match (frame.ftype) {
+            case 0x04 => // SETTINGS
+                if (settingsRead) { throw Exception("duplicate HTTP/3 SETTINGS") }
+                let seen = HashMap<UInt64, Bool>()
+                var remoteCapacity: Int64 = 0
+                while (!r.eof()) {
+                    let id = Varint.read(r)
+                    let value = Varint.read(r)
+                    if (seen.contains(id) || (id >= 2 && id <= 5)) {
+                        throw Exception("invalid HTTP/3 setting")
+                    }
+                    seen.add(id, true)
+                    if (id == 1) { remoteCapacity = Int64(value) }
+                    if (id == 7) { peerBlockedStreams = Int64(value) }
+                }
+                settingsRead = true
+                insertAuthority(remoteCapacity)
+            case 0x07 => // GOAWAY
+                let id = Int64(Varint.read(r))
+                if (!r.eof() || id % 4 != 0 || id > goawayId.getOrDefault({ => Int64.Max })) {
+                    fail(0x108, "invalid HTTP/3 GOAWAY stream ID")
+                } else {
+                    goawayId = Some(id)
+                }
+            case 0x03 => // CANCEL_PUSH
+                let id = Int64(Varint.read(r))
+                if (!r.eof() || id > maxPushId) {
+                    fail(0x108, "invalid CANCEL_PUSH ID")
+                } else {
+                    pushes.remove(id)
+                }
+            case 0x00 | 0x01 | 0x05 | 0x0d =>
+                fail(0x105, "frame forbidden on server control stream")
+            case _ => ()
+        }
+    }
+
+    private func insertAuthority(remoteCapacity: Int64): Unit {
+        let value = authority().toArray()
+        let capacity = 42 + value.size
+        if (remoteCapacity < capacity) { return }
+        let w = ByteWriter(value.size + 16)
+        putPrefixed(w, 0x20, 5, capacity)
+        putPrefixed(w, 0xc0, 6, 0) // Insert With Name Reference, static :authority.
+        putPrefixed(w, 0, 7, value.size)
+        w.putBytes(value)
+        authorityInserted = true
+        conn.sendStream(encoderStream, w.toArray(), false)
+    }
+
+    private func onDecoderInstruction(r: ByteReader): Unit {
+        let first = r.readU8()
+        if ((first & 0x80) != 0) {
+            let id = readPrefixed(r, first, 7)
+            if (!outstandingSections.contains(id)) {
+                throw Exception("unexpected QPACK section acknowledgment")
+            }
+            outstandingSections.remove(id)
+            authorityAcknowledged = true
+        } else if ((first & 0x40) != 0) {
+            outstandingSections.remove(readPrefixed(r, first, 6))
+        } else {
+            let increment = readPrefixed(r, first, 6)
+            if (increment != 1 || !authorityInserted || authorityAcknowledged) {
+                throw Exception("invalid QPACK insert count increment")
+            }
+            authorityAcknowledged = true
+        }
+    }
+
+    private func pushFor(id: Int64): Http3Push {
+        if (id < 0 || id > maxPushId) {
+            throw Exception("push ID exceeds the advertised maximum")
+        }
+        if (let Some(push) <- pushes.get(id)) {
+            return push
+        }
+        let push = Http3Push(id)
+        pushes.add(id, push)
+        return push
+    }
+
+    private func fail(code: UInt64, message: String): Unit {
+        conn.lastError = message
+        conn.closeApplication(code, message)
     }
 
     private func waitResponse(req: QuicStream): HttpResponse {
-        let resp = HttpResponse()
+        let reader = ResponseReader()
         let deadline = nowMillis() + 15000
-        var frameBuf = ByteWriter(4096)
-        var headersSeen = false
-        while (nowMillis() < deadline) {
-            if (conn.closed) {
+        while (!conn.closed && nowMillis() < deadline) {
+            pollOnce()
+            if (let Some(code) <- req.receiveReset) {
+                reader.response.rejected = code == 0x10b // H3_REQUEST_REJECTED
+                conn.lastError = "HTTP/3 request stream reset"
                 break
             }
-            conn.pollOnce()
-            conn.flushStreams()
-            let data = req.recvBuf.toArray()
-            if (data.size > frameBuf.size) {
-                // append only the new bytes
-                let have = frameBuf.size
-                frameBuf.putBytes(data, have, data.size - have)
-            }
-            // parse frames
-            var progress = true
-            while (progress) {
-                progress = false
-                let all = frameBuf.toArray()
-                if (all.size < 2) {
-                    break
-                }
-                let r = ByteReader(all)
-                let ftype = Int64(Varint.read(r))
-                if (r.pos > all.size) {
-                    break
-                }
-                let lr = ByteReader(all, r.pos, all.size)
-                let flen = Int64(Varint.read(lr))
-                if (lr.pos + flen > all.size) {
-                    break
-                }
-                let payload = sliceBytes(all, lr.pos, flen)
-                let consumed = lr.pos + flen
-                let rest = sliceBytes(all, consumed, all.size - consumed)
-                frameBuf.clear()
-                frameBuf.putBytes(rest)
-                if (ftype == H3Frame.HEADERS) {
-                    let hs = qpackDecode(payload, dynTable, dynCount)
-                    var i = 0
-                    while (i < hs.size) {
-                        if (hs[i].name == ":status") {
-                            resp.status = parseInt(hs[i].value)
-                        }
-                        if (resp.headerCount < resp.headers.size) {
-                            resp.headers[resp.headerCount] = hs[i]
-                            resp.headerCount++
-                        }
-                        i++
-                    }
-                    headersSeen = true
-                } else if (ftype == H3Frame.DATA) {
-                    resp.body = concat(resp.body, payload)
-                } else if (ftype == H3Frame.GOAWAY) {
-                    resp.complete = true
-                }
-                progress = true
-            }
-            if (req.recvFin && frameBuf.size == 0) {
-                resp.complete = true
+            if (req.id >= goawayId.getOrDefault({ => Int64.Max })) {
+                reader.response.rejected = true
                 break
             }
-            if (headersSeen && req.recvFin) {
-                resp.complete = true
+            try {
+                readResponse(req, reader, true)
+            } catch (e: Exception) {
+                fail(0x10e, e.message)
+            }
+            if (reader.response.complete) {
                 break
             }
         }
-        return resp
+        if (!reader.response.complete && !conn.closed && nowMillis() >= deadline) {
+            conn.lastError = "HTTP/3 response timeout"
+        }
+        if (!reader.response.complete) {
+            reader.response.body = reader.body.toArray()
+        }
+        return reader.response
+    }
+
+    private func readResponse(stream: QuicStream, reader: ResponseReader, allowPromise: Bool): Unit {
+        if (reader.response.complete || stream.receiveReset.isSome() ||
+            (reader.lastSize == stream.recvBuf.size && !stream.recvFin)) {
+            return
+        }
+        if (stream.recvBuf.size > maxResponseBytes) {
+            throw Exception("HTTP/3 response limit exceeded")
+        }
+        reader.lastSize = stream.recvBuf.size
+        let input = stream.recvBuf.reader(offset: reader.offset)
+        while (!input.eof()) {
+            if (let Some(frame) <- readFrame(input)) {
+                handleResponseFrame(reader, stream.id, frame, allowPromise)
+                reader.offset = input.pos
+            } else {
+                break
+            }
+        }
+        conn.extendReceiveWindow(stream, stream.recvOff)
+        if (stream.recvFin) {
+            if (reader.offset != input.end || reader.response.status < 200) {
+                throw Exception("incomplete HTTP/3 response")
+            }
+            reader.response.body = reader.body.toArray()
+            reader.response.complete = true
+            stream.recvBuf = ByteWriter(1)
+        }
+    }
+
+    private func readFrame(reader: ByteReader): Option<H3Frame> {
+        let start = reader.pos
+        if (!hasVarint(reader)) {
+            return None
+        }
+        let kind = Int64(Varint.read(reader))
+        if (!hasVarint(reader)) {
+            reader.pos = start
+            return None
+        }
+        let length = Int64(Varint.read(reader))
+        if (length > reader.remaining()) {
+            reader.pos = start
+            return None
+        }
+        return Some(H3Frame(kind, reader.readBytes(length)))
+    }
+
+    private func hasVarint(reader: ByteReader): Bool {
+        return !reader.eof() && reader.remaining() >= (1 << (reader.data[reader.pos] >> 6))
+    }
+
+    private func decodeSection(payload: Array<UInt8>, sid: Int64): Array<H3Header> {
+        let (headers, required) = qpack.fields(payload)
+        if (required != 0 && !conn.closed) {
+            let ack = ByteWriter(8)
+            putPrefixed(ack, 0x80, 7, sid)
+            conn.sendStream(decoderStream, ack.toArray(), false)
+        }
+        return headers
+    }
+
+    private func handleResponseFrame(reader: ResponseReader, sid: Int64, frame: H3Frame,
+        allowPromise: Bool): Unit {
+        let resp = reader.response
+        if (frame.ftype == H3Frame.HEADERS) {
+            let headers = decodeSection(frame.payload, sid)
+            var status: Int64 = 0
+            for (header in headers) {
+                if (header.name == ":status") {
+                    if (status != 0 || header.value.toArray().size != 3) {
+                        throw Exception("invalid HTTP/3 status")
+                    }
+                    status = parseInt(header.value)
+                }
+            }
+            if (reader.trailersSeen || (resp.status >= 200 && status != 0) ||
+                (resp.status < 200 && status < 100)) {
+                throw Exception("unexpected HTTP/3 HEADERS")
+            }
+            reader.trailersSeen = resp.status >= 200
+            if (status != 0) {
+                resp.status = status
+            }
+            if (resp.status >= 200) {
+                let combined = Array<H3Header>(resp.headerCount + headers.size, repeat: H3Header())
+                for (i in 0..resp.headerCount) {
+                    combined[i] = resp.headers[i]
+                }
+                for (i in 0..headers.size) {
+                    combined[resp.headerCount + i] = headers[i]
+                }
+                resp.headers = combined
+                resp.headerCount = combined.size
+            }
+        } else if (frame.ftype == H3Frame.DATA && resp.status >= 200 && !reader.trailersSeen) {
+            reader.body.putBytes(frame.payload)
+        } else if (frame.ftype == H3Frame.PUSH_PROMISE && allowPromise) {
+            let input = ByteReader(frame.payload)
+            let push = pushFor(Int64(Varint.read(input)))
+            let fields = decodeSection(input.readBytes(input.remaining()), sid)
+            if (push.promisedHeaders.size > 0) {
+                if (push.promisedHeaders.size != fields.size) {
+                    throw Exception("inconsistent push promise")
+                }
+                for (i in 0..fields.size) {
+                    if (push.promisedHeaders[i].name != fields[i].name ||
+                        push.promisedHeaders[i].value != fields[i].value) {
+                        throw Exception("inconsistent push promise")
+                    }
+                }
+            } else {
+                push.promisedHeaders = fields
+            }
+        } else if (frame.ftype == H3Frame.DATA || frame.ftype == H3Frame.GOAWAY ||
+            frame.ftype == H3Frame.SETTINGS || frame.ftype == H3Frame.PUSH_PROMISE ||
+            frame.ftype == H3Frame.CANCEL_PUSH || frame.ftype == H3Frame.MAX_PUSH_ID) {
+            throw Exception("unexpected HTTP/3 response frame")
+        }
     }
 
     private func parseInt(s: String): Int64 {
@@ -483,9 +873,10 @@ public class Http3Client {
         let b = s.toArray()
         var i = 0
         while (i < b.size) {
-            if (b[i] >= 48 && b[i] <= 57) {
-                v = v * 10 + Int64(b[i] - 48)
+            if (b[i] < 48 || b[i] > 57) {
+                throw Exception("invalid HTTP/3 status")
             }
+            v = v * 10 + Int64(b[i] - 48)
             i++
         }
         return v

@@ -6,3 +6,4 @@
 
 [dependencies]
   quic = { path = "../../quic" }
+  quic_openssl = { path = "../../quic_openssl" }

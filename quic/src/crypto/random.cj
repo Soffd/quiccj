@@ -1,29 +1,27 @@
 package quic.crypto
 
 import std.fs.*
-import std.random.*
 
-private let RAND_STATE: Array<UInt8> = Array<UInt8>(1, repeat: 0)
-
-/** OS randomness from /dev/urandom; falls back to a time-mixed PRNG. */
+/** Linux and Android OS randomness. A failed CSPRNG read fails the connection. */
 public func randomBytes(n: Int64): Array<UInt8> {
     let out = Array<UInt8>(n, repeat: 0)
+    if (n == 0) {
+        return out
+    }
+    let file = File("/dev/urandom", OpenMode.Read)
     try {
-        let f = File("/dev/urandom", OpenMode.Read)
-        let got = f.read(out)
-        f.close()
-        if (got == n) {
-            return out
+        var offset = file.read(out)
+        while (offset < n) {
+            let rest = Array<UInt8>(n - offset, repeat: 0)
+            let count = file.read(rest)
+            if (count <= 0) {
+                throw Exception("OS randomness unavailable")
+            }
+            copyBytes(out, offset, rest, 0, count)
+            offset += count
         }
-    } catch (e: Exception) {
-        // fall through
+        return out
+    } finally {
+        file.close()
     }
-    // degraded fallback: never used when /dev/urandom exists
-    let rnd = Random()
-    var i = 0
-    while (i < n) {
-        out[i] = UInt8(rnd.nextInt32() & 0xFF)
-        i++
-    }
-    return out
 }

@@ -11,7 +11,7 @@ public class ByteWriter {
     }
 
     public init(capacity: Int64) {
-        buf = Array<UInt8>(capacity, repeat: 0)
+        buf = Array<UInt8>(if (capacity > 0) { capacity } else { 1 }, repeat: 0)
         len = 0
     }
 
@@ -91,6 +91,11 @@ public class ByteWriter {
         return sliceBytes(buf, 0, len)
     }
 
+    /** View written bytes without copying. Use before the next write to this buffer. */
+    public func reader(offset!: Int64 = 0): ByteReader {
+        return ByteReader(buf, offset, len)
+    }
+
     /** Overwrite a previously written area (used for length backpatching). */
     public func patchU16(off: Int64, v: UInt16): Unit {
         putBeU16(buf, off, v)
@@ -168,7 +173,7 @@ public class ByteReader {
     }
 
     public func readBytes(n: Int64): Array<UInt8> {
-        if (pos + n > end) {
+        if (n < 0 || n > end - pos) {
             throw Exception("buffer underflow")
         }
         let v = sliceBytes(data, pos, n)

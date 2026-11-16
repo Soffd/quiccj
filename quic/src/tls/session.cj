@@ -1,8 +1,9 @@
 package quic.tls
 
 import quic.crypto.*
-import std.fs.*
 import std.time.*
+import std.net.IPAddress
+import std.collection.HashSet
 
 /*
  * TLS 1.3 client handshake, QUIC profile (RFC 9001 §4): no record layer.
@@ -13,7 +14,52 @@ import std.time.*
 public class TlsDirection {
     public var key: Array<UInt8> = Array<UInt8>(0, repeat: 0)
     public var iv: Array<UInt8> = Array<UInt8>(0, repeat: 0)
+    public var secret: Array<UInt8> = []
     public var hp: Array<UInt8> = Array<UInt8>(0, repeat: 0)
+}
+
+/** An authenticated TLS ticket. Store and transmit it as a session secret. */
+public class TlsTicket {
+    public let host: String
+    public let alpn: String
+    public let identity: Array<UInt8>
+    public let psk: Array<UInt8>
+    public let cipherSuite: Int64
+    public let ageAdd: UInt32
+    public let issuedAtMillis: Int64
+    public let lifetimeSeconds: Int64
+    public let earlyData: Bool
+
+    init(host: String, alpn: String, identity: Array<UInt8>, psk: Array<UInt8>, cipherSuite: Int64,
+        ageAdd: UInt32, lifetimeSeconds: Int64, earlyData: Bool) {
+        this.host = host
+        this.alpn = alpn
+        this.identity = identity
+        this.psk = psk
+        this.cipherSuite = cipherSuite
+        this.ageAdd = ageAdd
+        this.issuedAtMillis = unixMillis()
+        this.lifetimeSeconds = lifetimeSeconds
+        this.earlyData = earlyData
+    }
+
+    public func usable(host: String, alpn: String): Bool {
+        let age = unixMillis() - issuedAtMillis
+        return this.host == host && this.alpn == alpn && age >= 0 && age < lifetimeSeconds * 1000
+    }
+
+    @OverflowWrapping
+    func obfuscatedAge(): UInt32 {
+        return UInt32(unixMillis() - issuedAtMillis) + ageAdd
+    }
+}
+
+private func unixMillis(): Int64 {
+    return DateTime.now().toUnixTimeStamp().toMilliseconds()
+}
+
+private func suiteHash(suite: Int64): HashAlg {
+    return if (suite == 0x1302) { HashAlg.Sha384 } else { HashAlg.Sha256 }
 }
 
 public class TlsClient {
@@ -23,11 +69,18 @@ public class TlsClient {
     public let store: TrustStore
     public var debug: Bool = false
     public let verifyPeer: Bool
+    public let backend: CryptoBackend
+    private let labelPrefix: String
 
     private var x25519Priv: Array<UInt8>
     private var x25519Pub: Array<UInt8>
     private var clientRandom: Array<UInt8>
-    private var sessionId: Array<UInt8>
+    private var p256Priv: Array<UInt8> = []
+    private var p256Pub: Array<UInt8> = []
+    private var shareGroup: UInt16 = 0x001d
+    private var retrySuite: Int64 = 0
+    private var cookie: Array<UInt8> = []
+    private let hrrRandom = hexDecode("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
     private var transcript: ByteWriter
     private var hsBuf: ByteWriter
     private var outBuf: ByteWriter
@@ -47,21 +100,39 @@ public class TlsClient {
     public var hasPeerCert: Bool
     public var handshakeComplete: Bool
     private var handshakeSecret: Array<UInt8>
+    public let ticket: Option<TlsTicket>
+    public let allowEarlyData: Bool
+    public var newTicket: Option<TlsTicket> = None
+    public var earlyAccepted = false
+    public var resumed = false
+    public var earlyKeys: Option<TlsDirection> = None
+    private var offeredEarly = false
+    private var resumptionMaster: Array<UInt8> = []
     private var masterSecret: Array<UInt8>
     private var serverHsSecret: Array<UInt8>
     private var clientHsSecret: Array<UInt8>
 
     public init(host: String, alpn: String, quicParams: Array<UInt8>, store: TrustStore,
-        verifyPeer: Bool) {
+        verifyPeer: Bool, backend!: CryptoBackend = PURE_CRYPTO, ticket!: Option<TlsTicket> = None,
+        allowEarlyData!: Bool = false, labelPrefix!: String = "quic ") {
         this.host = host
         this.alpnList = [alpn]
         this.quicParams = quicParams
         this.store = store
         this.verifyPeer = verifyPeer
+        this.backend = backend
+        this.labelPrefix = labelPrefix
+        this.ticket = if (let Some(candidate) <- ticket) {
+            if (verifyPeer && candidate.usable(host, alpn)) { Some(candidate) } else { None }
+        } else {
+            None
+        }
+        this.allowEarlyData = allowEarlyData
         x25519Priv = randomBytes(32)
-        x25519Pub = X25519.publicKey(x25519Priv)
+        let base = Array<UInt8>(32, repeat: 0)
+        base[0] = 9
+        x25519Pub = backend.x25519(x25519Priv, base)
         clientRandom = randomBytes(32)
-        sessionId = randomBytes(32)
         transcript = ByteWriter(4096)
         hsBuf = ByteWriter(4096)
         outBuf = ByteWriter(4096)
@@ -90,7 +161,7 @@ public class TlsClient {
     }
 
     private func transcriptHash(): Array<UInt8> {
-        return hashOf(hashAlg, transcript.toArray())
+        return backend.digest(hashAlg, transcript.toArray())
     }
 
     private func addTranscript(msg: Array<UInt8>): Unit {
@@ -105,21 +176,29 @@ public class TlsClient {
         // RFC 9001 section 8.4: QUIC forbids the TLS 1.3 middlebox-compat session id.
         body.putVec8(Array<UInt8>(0, repeat: 0))
         // cipher suites
-        body.putU16(4)
+        body.putU16(6)
         body.putU16(0x1301) // TLS_AES_128_GCM_SHA256
         body.putU16(0x1302) // TLS_AES_256_GCM_SHA384
+        body.putU16(0x1303) // TLS_CHACHA20_POLY1305_SHA256
         body.putU8(1)
         body.putU8(0) // null compression
 
         let ext = ByteWriter(512)
-        // server_name: ServerNameList -> ServerName{ name_type, HostName }
-        let sni = ByteWriter(64)
-        let hostBytes = host.toArray()
-        sni.putU16(UInt16(1 + 2 + hostBytes.size))
-        sni.putU8(0) // host_name
-        sni.putVec16(hostBytes)
-        ext.putU16(0x0000)
-        ext.putVec16(sni.toArray())
+        let dnsName = try {
+            IPAddress.parse(host)
+            false
+        } catch (e: Exception) {
+            true
+        }
+        if (dnsName) {
+            let sni = ByteWriter(64)
+            let hostBytes = host.toArray()
+            sni.putU16(UInt16(1 + 2 + hostBytes.size))
+            sni.putU8(0)
+            sni.putVec16(hostBytes)
+            ext.putU16(0x0000)
+            ext.putVec16(sni.toArray())
+        }
 
         // supported_groups: x25519, secp256r1
         let groups = ByteWriter(16)
@@ -131,11 +210,15 @@ public class TlsClient {
 
         // signature_algorithms
         let sigs = ByteWriter(32)
-        sigs.putU16(8)
+        sigs.putU16(16)
         sigs.putU16(0x0403) // ecdsa_secp256r1_sha256
         sigs.putU16(0x0503) // ecdsa_secp384r1_sha384
         sigs.putU16(0x0804) // rsa_pss_rsae_sha256
-        sigs.putU16(0x0401) // rsa_pkcs1_sha256
+        sigs.putU16(0x0805) // rsa_pss_rsae_sha384
+        sigs.putU16(0x0806) // rsa_pss_rsae_sha512
+        sigs.putU16(0x0401) // rsa_pkcs1_sha256 (certificate chains)
+        sigs.putU16(0x0501) // rsa_pkcs1_sha384 (certificate chains)
+        sigs.putU16(0x0601) // rsa_pkcs1_sha512 (certificate chains)
         ext.putU16(0x000d)
         ext.putVec16(sigs.toArray())
 
@@ -146,13 +229,19 @@ public class TlsClient {
         ext.putU16(0x002b)
         ext.putVec16(vers.toArray())
 
-        // key_share (x25519)
-        let ks = ByteWriter(40)
-        ks.putU16(36)
-        ks.putU16(0x001d)
-        ks.putVec16(x25519Pub)
+        let share = if (shareGroup == 0x001d) { x25519Pub } else { p256Pub }
+        let ks = ByteWriter(share.size + 6)
+        ks.putU16(UInt16(share.size + 4))
+        ks.putU16(shareGroup)
+        ks.putVec16(share)
         ext.putU16(0x0033)
         ext.putVec16(ks.toArray())
+        if (cookie.size > 0) {
+            let encoded = ByteWriter(cookie.size + 2)
+            encoded.putVec16(cookie)
+            ext.putU16(0x002c)
+            ext.putVec16(encoded.toArray())
+        }
 
         // ALPN
         let alpn = ByteWriter(32)
@@ -170,14 +259,59 @@ public class TlsClient {
         ext.putU16(0x0039)
         ext.putVec16(quicParams)
 
-        body.putU16(UInt16(ext.size))
-        body.putBytes(ext.toArray())
+        if (verifyPeer) {
+            ext.putU16(0x002d) // psk_key_exchange_modes
+            ext.putVec16([1, 1]) // psk_dhe_ke
+        }
+        var bindersSize: Int64 = 0
+        let activeTicket = if (let Some(value) <- ticket) {
+            if (retrySuite == 0 || hashSize(suiteHash(value.cipherSuite)) == hashLen()) {
+                Some(value)
+            } else {
+                Option<TlsTicket>.None
+            }
+        } else {
+            Option<TlsTicket>.None
+        }
+        if (let Some(session) <- activeTicket) {
+            // RFC 8446 §4.2.11: PSK must be the final ClientHello extension.
+            offeredEarly = allowEarlyData && session.earlyData && retrySuite == 0
+            if (offeredEarly) {
+                ext.putU16(0x002a)
+                ext.putVec16([])
+            }
+            let identities = ByteWriter(session.identity.size + 8)
+            identities.putVec16(session.identity)
+            identities.putU32(session.obfuscatedAge())
+            let hlen = hashSize(suiteHash(session.cipherSuite))
+            bindersSize = hlen + 3
+            ext.putU16(0x0029)
+            ext.putU16(UInt16(2 + identities.size + bindersSize))
+            ext.putVec16(identities.toArray())
+        }
 
-        let content = body.toArray()
-        let msg = ByteWriter(content.size + 4)
-        msg.putU8(1) // client_hello
-        msg.putU24(UInt32(content.size))
-        msg.putBytes(content)
+        body.putU16(UInt16(ext.size + bindersSize))
+        body.putBytes(ext.toArray())
+        let msg = ByteWriter(body.size + 4 + bindersSize)
+        msg.putU8(1)
+        msg.putU24(UInt32(body.size + bindersSize))
+        msg.putBytes(body.toArray())
+        if (let Some(session) <- activeTicket) {
+            let alg = suiteHash(session.cipherSuite)
+            let early = computeEarlySecret(alg, session.psk)
+            let binderKey = deriveSecret(alg, early, "res binder", backend.digest(alg, []), backend: backend)
+            let finished = hkdfExpandLabel(alg, binderKey, "finished", [], hashSize(alg), backend: backend)
+            let hash = backend.digest(alg, concat(transcript.toArray(), msg.toArray()))
+            let binder = hmac(alg, finished, hash, backend: backend)
+            msg.putU16(UInt16(binder.size + 1))
+            msg.putVec8(binder)
+            if (offeredEarly) {
+                let keyLen = if (session.cipherSuite == 0x1301) { 16 } else { 32 }
+                let th = backend.digest(alg, msg.toArray())
+                let secret = deriveSecret(alg, early, "c e traffic", th, backend: backend)
+                earlyKeys = Some(packetKeys(secret, alg, keyLen))
+            }
+        }
         return msg.toArray()
     }
 
@@ -195,75 +329,71 @@ public class TlsClient {
         return out
     }
 
-    public func onData(data: Array<UInt8>): Unit {
-        hsBuf.putBytes(data)
+    private let cryptoBuffers = [ByteWriter(1024), ByteWriter(4096), ByteWriter(1024)]
+
+    // The standalone TLS driver can supply a contiguous transcript. QUIC
+    // callers supply the packet number space and keep separate CRYPTO streams.
+    public func onData(data: Array<UInt8>, cryptoSpace!: Int64 = -1): Unit {
+        if (state == 7) {
+            return
+        }
         try {
-            while (true) {
-                let all = hsBuf.toArray()
-                if (all.size < 4) {
-                    return
+            let buffer = if (cryptoSpace == -1) { hsBuf } else { cryptoBuffers[cryptoSpace] }
+            buffer.putBytes(data)
+            let reader = buffer.reader()
+            while (reader.remaining() >= 4) {
+                let kind = reader.data[reader.pos]
+                if (cryptoSpace >= 0 && messageSpace(kind) != cryptoSpace) {
+                    throw Exception("TLS handshake message at the wrong QUIC encryption level")
                 }
-                let msgLen = Int64(beU24(all, 1))
-                if (all.size < 4 + msgLen) {
-                    return
+                let length = 4 + Int64(beU24(reader.data, reader.pos + 1))
+                if (reader.remaining() < length) {
+                    break
                 }
-                let msg = sliceBytes(all, 0, 4 + msgLen)
-                let rest = sliceBytes(all, 4 + msgLen, all.size - 4 - msgLen)
-                hsBuf.clear()
-                hsBuf.putBytes(rest)
-                handleMessage(msg)
-                if (state == 6 || state == 7) {
-                    return
-                }
+                handleMessage(reader.readBytes(length))
+            }
+            if (reader.pos != 0) {
+                let remaining = reader.readBytes(reader.remaining())
+                buffer.clear()
+                buffer.putBytes(remaining)
             }
         } catch (e: Exception) {
-            failure = "handshake error: ${e}"
+            failure = "handshake error: " + e.toString()
             state = 7
+        }
+    }
+
+    private func messageSpace(kind: UInt8): Int64 {
+        match (kind) {
+            case 2 => 0 // ServerHello and HelloRetryRequest
+            case 8 | 11 | 15 | 20 => 1
+            case 4 => 2 // NewSessionTicket
+            case _ => -1
         }
     }
 
     private func handleMessage(msg: Array<UInt8>): Unit {
         let msgType = msg[0]
-        if (msgType == 2) {
-            // The handshake traffic secrets cover ClientHello..ServerHello, so the
-            // ServerHello must be in the transcript before keys are derived.
-            addTranscript(msg)
+        if (msgType == 2 && state == 1) {
             handleServerHello(msg)
-        } else if (msgType == 8) {
-            // EncryptedExtensions; ignore retransmitted duplicates.
-            if (state < 2) {
-                throw Exception("unexpected EncryptedExtensions")
-            }
-            if (state > 3) {
-                return
-            }
+        } else if (msgType == 8 && state == 2) {
             addTranscript(msg)
             handleEncryptedExtensions(msg)
             state = 3
-        } else if (msgType == 11) {
-            if (state > 4) {
-                return
-            }
+        } else if (msgType == 11 && state == 3 && !resumed) {
             addTranscript(msg)
             handleCertificate(msg)
             state = 4
-        } else if (msgType == 15) {
-            // The signature covers the transcript up to, but not including,
-            // the CertificateVerify message itself (RFC 8446 section 4.4.3).
+        } else if (msgType == 15 && state == 4) {
             handleCertificateVerify(msg)
             addTranscript(msg)
             state = 5
-        } else if (msgType == 20) {
-            if (state >= 6) {
-                return
-            }
+        } else if (msgType == 20 && (state == 5 || (state == 3 && resumed))) {
             handleFinished(msg)
-        } else if (msgType == 4) {
-            // NewSessionTicket (after handshake) - ignored
-        } else if (msgType == 24) {
-            // KeyUpdate - handled by transport
+        } else if (msgType == 4 && state == 6) {
+            handleTicket(msg)
         } else {
-            throw Exception("unexpected handshake type ${msgType}")
+            throw Exception("unexpected handshake type " + "${msgType}")
         }
     }
 
@@ -271,114 +401,207 @@ public class TlsClient {
         let r = ByteReader(msg, 4, msg.size)
         let legacyVersion = r.readU16()
         let serverRandom = r.readBytes(32)
+        let isRetry = ctEqual(serverRandom, hrrRandom)
         let sid = r.readVec8()
         cipherSuite = Int64(r.readU16())
-        let comp = r.readU8()
-        if (cipherSuite == 0x1301) {
-            hashAlg = HashAlg.Sha256
-            keyLen = 16
-        } else if (cipherSuite == 0x1302) {
-            hashAlg = HashAlg.Sha384
-            keyLen = 32
-        } else {
-            throw Exception("unsupported cipher suite ${cipherSuite}")
+        let compression = r.readU8()
+        if (legacyVersion != 0x0303 || sid.size != 0 || compression != 0 ||
+            (retrySuite != 0 && (isRetry || retrySuite != cipherSuite))) {
+            throw Exception("invalid ServerHello")
         }
-        let extLen = Int64(r.readU16())
-        let exts = ByteReader(r.data, r.pos, r.pos + extLen)
-        var serverPub = Array<UInt8>(0, repeat: 0)
-        var group: Int64 = 0
+        match (cipherSuite) {
+            case 0x1301 =>
+                hashAlg = HashAlg.Sha256
+                keyLen = 16
+            case 0x1302 =>
+                hashAlg = HashAlg.Sha384
+                keyLen = 32
+            case 0x1303 =>
+                hashAlg = HashAlg.Sha256
+                keyLen = 32
+            case _ => throw Exception("unsupported cipher suite")
+        }
+        let exts = ByteReader(r.readVec16())
+        var version = false
+        var group: UInt16 = 0
+        var serverPub: Array<UInt8> = []
+        if (!r.eof()) {
+            throw Exception("trailing ServerHello data")
+        }
         while (!exts.eof()) {
-            let t = exts.readU16()
-            let body = exts.readVec16()
-            if (t == 0x0033) {
-                let ks = ByteReader(body)
-                group = Int64(ks.readU16())
-                serverPub = ks.readVec16()
+            let kind = exts.readU16()
+            let body = ByteReader(exts.readVec16())
+            if (kind == 0x002b && !version) {
+                version = body.readU16() == 0x0304
+            } else if (kind == 0x0033 && group == 0) {
+                group = body.readU16()
+                if (!isRetry) {
+                    serverPub = body.readVec16()
+                }
+            } else if (kind == 0x0029 && !isRetry && !resumed) {
+                if (let Some(session) <- ticket) {
+                    if (body.readU16() != 0 || hashSize(suiteHash(session.cipherSuite)) != hashLen()) {
+                        throw Exception("invalid TLS PSK selection")
+                    }
+                    resumed = true
+                } else {
+                    throw Exception("unexpected TLS PSK selection")
+                }
+            } else if (kind == 0x002c && isRetry && cookie.size == 0) {
+                cookie = body.readVec16()
+                if (cookie.size == 0) {
+                    throw Exception("empty HelloRetryRequest cookie")
+                }
+            } else {
+                throw Exception("unexpected ServerHello extension")
+            }
+            if (!body.eof()) {
+                throw Exception("invalid ServerHello extension")
             }
         }
-        if (serverPub.size == 0) {
-            throw Exception("no key_share in ServerHello")
+        if (!version) {
+            throw Exception("server did not select TLS 1.3")
         }
-        var shared: Array<UInt8>
-        if (group == 0x001d) {
-            shared = X25519.scalarmult(x25519Priv, serverPub)
+        if (isRetry) {
+            if ((group == 0 && cookie.size == 0) || (group != 0 && group != 0x0017)) {
+                throw Exception("invalid HelloRetryRequest group")
+            }
+            retrySuite = cipherSuite
+            earlyKeys = None
+            if (group == 0x0017) {
+                shareGroup = group
+                p256Priv = backend.p256Private()
+                p256Pub = backend.p256Public(p256Priv)
+            }
+            let firstHash = transcriptHash()
+            transcript.clear()
+            transcript.putU8(254)
+            transcript.putU24(UInt32(firstHash.size))
+            transcript.putBytes(firstHash)
+            addTranscript(msg)
+            let hello = buildClientHello()
+            addTranscript(hello)
+            outBuf.putBytes(hello)
+            return
+        }
+        if (group != shareGroup) {
+            throw Exception("server chose a key share the client did not send")
+        }
+        let shared = if (group == 0x001d && serverPub.size == 32) {
+            backend.x25519(x25519Priv, serverPub)
+        } else if (group == 0x0017 && serverPub.size == 65) {
+            backend.p256(p256Priv, serverPub)
         } else {
-            throw Exception("unsupported key share group ${group}")
+            throw Exception("invalid key share")
         }
+        if (ctEqual(shared, Array<UInt8>(shared.size, repeat: 0))) {
+            throw Exception("invalid all-zero shared secret")
+        }
+        fillBytes(x25519Priv, 0)
+        fillBytes(p256Priv, 0)
+        addTranscript(msg)
         deriveHandshakeSecrets(shared)
+        fillBytes(shared, 0)
         state = 2
+    }
+
+    private func computeEarlySecret(alg: HashAlg, psk: Array<UInt8>): Array<UInt8> {
+        let zeros = Array<UInt8>(hashSize(alg), repeat: 0)
+        return hkdfExtract(alg, zeros, if (psk.size == 0) { zeros } else { psk }, backend: backend)
     }
 
     private func deriveHandshakeSecrets(shared: Array<UInt8>): Unit {
         let zeros = Array<UInt8>(hashLen(), repeat: 0)
-        // RFC 8446 section 7.1: early_secret = HKDF-Extract(0, PSK) with a zero
-        // PSK of Hash.length bytes (not an empty string).
-        let earlySecret = hkdfExtract(hashAlg, zeros, zeros)
-        let derived = deriveSecret(hashAlg, earlySecret, "derived", hashOf(hashAlg,
-            Array<UInt8>(0, repeat: 0)))
-        handshakeSecret = hkdfExtract(hashAlg, derived, shared)
+        let earlySecret = computeEarlySecret(hashAlg, if (resumed) { ticket.getOrThrow().psk } else { [] })
+        let derived = deriveSecret(hashAlg, earlySecret, "derived", backend.digest(hashAlg, []), backend: backend)
+        handshakeSecret = hkdfExtract(hashAlg, derived, shared, backend: backend)
 
         let th = transcriptHash()
-        clientHsSecret = deriveSecret(hashAlg, handshakeSecret, "c hs traffic", th)
-        serverHsSecret = deriveSecret(hashAlg, handshakeSecret, "s hs traffic", th)
+        clientHsSecret = deriveSecret(hashAlg, handshakeSecret, "c hs traffic", th, backend: backend)
+        serverHsSecret = deriveSecret(hashAlg, handshakeSecret, "s hs traffic", th, backend: backend)
         clientHs = trafficKeys(clientHsSecret)
         serverHs = trafficKeys(serverHsSecret)
 
-        let derived2 = deriveSecret(hashAlg, handshakeSecret, "derived", hashOf(hashAlg,
-            Array<UInt8>(0, repeat: 0)))
-        masterSecret = hkdfExtract(hashAlg, derived2, zeros)
+        let derived2 = deriveSecret(hashAlg, handshakeSecret, "derived", backend.digest(hashAlg, []), backend: backend)
+        masterSecret = hkdfExtract(hashAlg, derived2, zeros, backend: backend)
     }
 
     private func trafficKeys(secret: Array<UInt8>): TlsDirection {
+        return packetKeys(secret, hashAlg, keyLen)
+    }
+
+    private func packetKeys(secret: Array<UInt8>, alg: HashAlg, length: Int64): TlsDirection {
         let k = TlsDirection()
-        // RFC 9001 section 5.1: QUIC uses the labels "quic key"/"quic iv"/"quic hp".
-        k.key = hkdfExpandLabel(hashAlg, secret, "quic key", Array<UInt8>(0, repeat: 0), keyLen)
-        k.iv = hkdfExpandLabel(hashAlg, secret, "quic iv", Array<UInt8>(0, repeat: 0), 12)
-        k.hp = hkdfExpandLabel(hashAlg, secret, "quic hp", Array<UInt8>(0, repeat: 0), keyLen)
+        k.secret = secret
+        k.key = hkdfExpandLabel(alg, secret, labelPrefix + "key", [], length, backend: backend)
+        k.iv = hkdfExpandLabel(alg, secret, labelPrefix + "iv", [], 12, backend: backend)
+        k.hp = hkdfExpandLabel(alg, secret, labelPrefix + "hp", [], length, backend: backend)
         return k
     }
 
     private func handleEncryptedExtensions(msg: Array<UInt8>): Unit {
         let r = ByteReader(msg, 4, msg.size)
-        let extLen = Int64(r.readU16())
-        let exts = ByteReader(r.data, r.pos, r.pos + extLen)
+        let exts = ByteReader(r.readVec16())
+        let seen = HashSet<UInt16>()
+        if (!r.eof()) {
+            throw Exception("invalid EncryptedExtensions")
+        }
         while (!exts.eof()) {
-            let t = exts.readU16()
+            let kind = exts.readU16()
             let body = exts.readVec16()
-            if (t == 0x0010) {
+            if (seen.contains(kind)) {
+                throw Exception("duplicate TLS extension")
+            }
+            seen.add(kind)
+            if (kind == 0x0010) {
                 let a = ByteReader(body)
-                let listLen = Int64(a.readU16())
-                let list = ByteReader(a.data, a.pos, a.pos + listLen)
-                if (!list.eof()) {
-                    negotiatedAlpn = String.fromUtf8(list.readVec8())
+                let list = ByteReader(a.readVec16())
+                negotiatedAlpn = String.fromUtf8(list.readVec8())
+                if (!a.eof() || !list.eof()) {
+                    throw Exception("invalid negotiated ALPN")
                 }
-            } else if (t == 0x0039) {
+            } else if (kind == 0x0039) {
                 peerParams = body
+            } else if (kind == 0x002a) {
+                if (body.size != 0 || !offeredEarly || !resumed ||
+                    ticket.getOrThrow().cipherSuite != cipherSuite) {
+                    throw Exception("invalid TLS early_data extension")
+                }
+                earlyAccepted = true
+            } else if (kind != 0x0000 && kind != 0x000a) {
+                throw Exception("unexpected EncryptedExtensions extension")
             }
         }
-        if (negotiatedAlpn == "") {
-            throw Exception("server did not negotiate ALPN")
+        if (negotiatedAlpn != alpnList[0] || peerParams.size == 0) {
+            throw Exception("missing HTTP/3 ALPN or QUIC transport parameters")
         }
     }
 
     private func handleCertificate(msg: Array<UInt8>): Unit {
         let r = ByteReader(msg, 4, msg.size)
-        let ctx = r.readVec8()
-        let listLen = Int64(r.readU24())
-        let list = ByteReader(r.data, r.pos, r.pos + listLen)
+        if (r.readVec8().size != 0) {
+            throw Exception("invalid Certificate request context")
+        }
+        let list = ByteReader(r.readVec24())
+        if (!r.eof()) {
+            throw Exception("invalid Certificate message")
+        }
         var chain = Array<X509Cert>(8, repeat: X509Cert())
         var count = 0
         while (!list.eof() && count < 8) {
             let certData = list.readVec24()
-            let exts = list.readVec16()
+            list.readVec16()
             chain[count] = X509Cert.parse(certData)
             count++
+        }
+        if (count == 0 || !list.eof()) {
+            throw Exception("invalid certificate chain length")
         }
         peerCert = chain[0]
         hasPeerCert = true
         if (verifyPeer) {
             let now = nowSeconds()
-            let ok = verifyCertificateChain(chain, count, store, host, now)
+            let ok = backend.verifyChain(chain, count, store, host, now)
             if (!ok) {
                 throw Exception("certificate verification failed for ${host}")
             }
@@ -398,62 +621,69 @@ public class TlsClient {
         content[off] = 0
         off++
         copyBytes(content, off, th, 0, th.size)
-        var ok = false
-        if (scheme == 0x0403) {
-            let h = sha256(content)
-            let rs = parseSig(sig)
-            ok = CURVE_P256.verify(peerCert.spki, h, rs[0], rs[1])
-        } else if (scheme == 0x0503) {
-            let h = sha384(content)
-            let rs = parseSig(sig)
-            ok = CURVE_P384.verify(peerCert.spki, h, rs[0], rs[1])
-        } else if (scheme == 0x0804) {
-            ok = false // RSA-PSS not implemented
-        }
-        if (!ok) {
+        if (!r.eof() || !backend.verifyHandshake(peerCert, scheme, content, sig)) {
             throw Exception("CertificateVerify failed")
         }
     }
 
-    private func parseSig(sig: Array<UInt8>): (Array<UInt8>, Array<UInt8>) {
-        let d = Der(sig, 0, sig.size)
-        let seq = d.enter(0x30)
-        return (seq.readIntegerBytes(), seq.readIntegerBytes())
-    }
-
     private func handleFinished(msg: Array<UInt8>): Unit {
-        if (state != 5) {
-            throw Exception("unexpected Finished")
-        }
         let r = ByteReader(msg, 4, msg.size)
         let verify = r.readBytes(hashLen())
         let finishedKey = hkdfExpandLabel(hashAlg, serverHsSecret, "finished",
-            Array<UInt8>(0, repeat: 0), hashLen())
-        let expected = hmac(hashAlg, finishedKey, transcriptHash())
-        if (!ctEqual(verify, expected)) {
+            [], hashLen(), backend: backend)
+        let expected = hmac(hashAlg, finishedKey, transcriptHash(), backend: backend)
+        if (!r.eof() || !ctEqual(verify, expected)) {
             throw Exception("server Finished verify_data mismatch")
         }
         addTranscript(msg)
         // application secrets
         let th = transcriptHash()
-        let clientAppSecret = deriveSecret(hashAlg, masterSecret, "c ap traffic", th)
-        let serverAppSecret = deriveSecret(hashAlg, masterSecret, "s ap traffic", th)
+        let clientAppSecret = deriveSecret(hashAlg, masterSecret, "c ap traffic", th, backend: backend)
+        let serverAppSecret = deriveSecret(hashAlg, masterSecret, "s ap traffic", th, backend: backend)
         clientApp = trafficKeys(clientAppSecret)
         serverApp = trafficKeys(serverAppSecret)
         // client Finished
         let cFinKey = hkdfExpandLabel(hashAlg, clientHsSecret, "finished",
-            Array<UInt8>(0, repeat: 0), hashLen())
-        let cVerify = hmac(hashAlg, cFinKey, th)
+            [], hashLen(), backend: backend)
+        let cVerify = hmac(hashAlg, cFinKey, th, backend: backend)
         let fin = ByteWriter(cVerify.size + 4)
         fin.putU8(20)
         fin.putU24(UInt32(cVerify.size))
         fin.putBytes(cVerify)
         let finMsg = fin.toArray()
         addTranscript(finMsg)
+        resumptionMaster = deriveSecret(hashAlg, masterSecret, "res master", transcriptHash(), backend: backend)
         outBuf.putBytes(finMsg)
         handshakeComplete = true
         state = 6
     }
+    private func handleTicket(msg: Array<UInt8>): Unit {
+        if (!verifyPeer) { return }
+        let r = ByteReader(msg, 4, msg.size)
+        let lifetime = Int64(r.readU32())
+        let ageAdd = r.readU32()
+        let nonce = r.readVec8()
+        let identity = r.readVec16()
+        let exts = ByteReader(r.readVec16())
+        if (!r.eof() || lifetime > 604800 || identity.size == 0) {
+            throw Exception("invalid TLS NewSessionTicket")
+        }
+        if (lifetime == 0) { return }
+        var early = false
+        while (!exts.eof()) {
+            let kind = exts.readU16()
+            let value = exts.readVec16()
+            if (kind == 0x002a) {
+                if (early || value.size != 4 || beU32(value, 0) != 0xffffffff) {
+                    throw Exception("invalid QUIC ticket early-data limit")
+                }
+                early = true
+            }
+        }
+        let psk = hkdfExpandLabel(hashAlg, resumptionMaster, "resumption", nonce, hashLen(), backend: backend)
+        newTicket = Some(TlsTicket(host, negotiatedAlpn, identity, psk, cipherSuite, ageAdd, lifetime, early))
+    }
+
 }
 
 public func nowSeconds(): Int64 {

@@ -1,134 +1,85 @@
-# quiccj — 纯仓颉 QUIC v1 / HTTP-3 客户端
+# quiccj
 
-用仓颉（Cangjie）从零实现的 QUIC v1 + HTTP/3 客户端库，**零 FFI、零外部依赖**：
-从大整数、AES-GCM、X25519、X.509 一直到 TLS 1.3、QUIC 传输层与 QPACK 全部自实现，
-不链接 OpenSSL，也不调用任何系统加密库。
+quiccj 是供仓颉应用嵌入的 QUIC v1/v2 和 HTTP/3 客户端库。核心包提供包保护、同步驱动的 QUIC 连接和流，以及 HTTP/3 GET。默认使用纯仓颉密码学。Linux 应用可以按连接选择独立的 OpenSSL 后端。
 
-**当前状态**：本地与 [aioquic](https://github.com/aiortc/aioquic) 服务端完成握手并成功
-`GET` 到 `200` + 响应体；`cjpm test` **28/28 通过**，含 RFC 9001 附录 A 的黄金包逐字节校验。
-详细证据与缺口见 [`quic/docs/STATUS.md`](quic/docs/STATUS.md)。
+## 功能
 
-```
-$ ./target/release/bin/main 127.0.0.1 / 4433 insecure
-handshake=true rx=1 closed=false reason= err=
-status: 200
-content-type: text/plain
-body bytes: 22
-hello from aioquic h3
-```
+- **QUIC** 支持 Initial、Handshake、0-RTT 和 1-RTT、ACK 范围、CRYPTO 和 STREAM 重组、连接及流级流控、RTT 和 PTO、包阈值及时间阈值重传、NewReno 拥塞控制、发送节奏控制、持续拥塞检测、Retry、版本协商、密钥轮换和本地 UDP 路径迁移。
+- **TLS 1.3** 支持 X25519、使用 P-256 的 HelloRetryRequest、ECDSA 和 RSA-PSS CertificateVerify、AES-GCM 和 ChaCha20-Poly1305、证书验证、会话票据和显式启用的 0-RTT。
+- **HTTP/3** 支持 SETTINGS、GET、响应头和响应体、GOAWAY、服务器推送，以及 QPACK 静态表、Huffman 和动态表。请求编码器可以复用 `:authority`，并遵守对端的阻塞流额度。
+- **信任配置** 由调用方传入 `TrustStore`。可以直接加载 PEM、自带信任根，或使用 `TrustStore.system()` 读取 `SSL_CERT_FILE` 及常见系统 CA 文件。
 
-## 特性
+## 构建与验证
 
-**密码学（`quic/src/crypto`）**
-
-- SHA-256 / SHA-384 / SHA-512，HMAC（SHA-256 64 字节块、SHA-384 128 字节块），HKDF，TLS 1.3 HKDF-Expand-Label
-- AES-128 / AES-256（32 位 T-table）、GHASH、AES-GCM（含 AAD、篡改检测）
-- 固定容量 `BigUint` + Montgomery CIOS 乘法、模幂、费马求逆
-- X25519（RFC 7748）；通用素域曲线 `EcCurve` + ECDSA 验签，支持 P-256 / P-384
-- RSA PKCS#1 v1.5 验签（SHA-256 / SHA-384；实现完成，尚未用 RSA 证书链实测）
-- DER/ASN.1、X.509（SAN / EKU / BasicConstraints / KeyUsage）、主机名匹配（单标签通配符）、
-  PEM、`TrustStore`、证书链验证（支持交叉签名链）
-
-**TLS 1.3（`quic/src/tls`）**
-
-- QUIC profile（无 TLS 记录层），ClientHello → Finished 全流程
-- `TLS_AES_128_GCM_SHA256`、`TLS_AES_256_GCM_SHA384`
-- X25519 key share、ALPN `h3`、QUIC transport parameters 扩展
-- EncryptedExtensions / Certificate / CertificateVerify（ECDSA P-256/P-384）/ Finished 校验
-
-**QUIC v1（`quic/src/transport`）**
-
-- varint、长短头包、首部保护、Initial 密钥派生、AEAD、包号编解码
-- 传输参数编解码、ACK、CRYPTO 流重组、STREAM 帧、流控字段、连接关闭
-- 无状态 `PacketBuilder`：连接层与黄金包测试**共用同一份**打包/解包代码
-
-**HTTP/3（`quic/src/http3`）**
-
-- QPACK：RFC 9204 附录 A 完整静态表（99 项）、字面量编码、field-section prefix、Huffman 解码
-- 控制流（SETTINGS）、QPACK encoder/decoder 单向流、HEADERS / DATA 帧、请求-响应
-
-## 环境要求
-
-- 仓颉工具链 **1.2.1**（`cjc` / `cjpm`），在 `aarch64-unknown-linux-gnu` 上验证
-- 运行测试与示例不需要网络
-- 仅**本地互通测试**需要 `python3` + `aioquic`（`pip install aioquic`）
-
-## 构建与测试
+在 WSL Ubuntu 上使用仓颉工具链 1.2.1。
 
 ```bash
-cd quic
-cjpm build
-cjpm test          # 28/28：密码学向量 + 包层 + RFC 9001 黄金包
+(cd quic && cjpm build && cjpm test)
+(cd quic_openssl && cjpm test)          # 需要 Linux OpenSSL 3 的 libcrypto.so.3
+(cd examples/h3get && cjpm build)
 ```
 
-## 运行示例
+`quic` 由仓颉代码和标准库组成。选择 `quic_openssl` 时，`OpenSslBackend()` 在运行时加载 `libcrypto.so.3`，通过 EVP 执行摘要、密钥交换、验签和包保护，并使用 OpenSSL 校验证书链。两个后端共用 QUIC、TLS 1.3 和 HTTP/3 状态机。
+
+## 命令行示例
 
 ```bash
 cd examples/h3get
-cjpm build
-./target/release/bin/main <host> <path> [port] [insecure]
-# 例：./target/release/bin/main cloudflare-quic.com / 443
-# 第 4 个参数为 insecure 时关闭证书校验（自签证书测试用）
+./target/release/bin/main cloudflare-quic.com / 443
+./target/release/bin/main cloudflare-quic.com / 443 system openssl
+./target/release/bin/main localhost / 4433 ../../interop/cert.pem
 ```
 
-本地互通（自签证书）：
+参数依次为 `host`、`path`、`port`、信任配置和密码学后端。信任配置可以是 `system`、CA PEM 文件或用于本地调试的 `insecure`。后端可以是 `pure` 或 `openssl`。公网示例默认验证证书。
+
+在项目根目录运行 aioquic 互通套件。套件生成短期测试证书和独立的 UDP 监听端口，并覆盖丢包、乱序、1 MiB 响应、固定 RTT 下的发送节奏和持续丢包后的恢复。
 
 ```bash
-cd interop
-sh gen_cert.sh          # 首次运行，生成 cert.pem / key.pem（私钥不入库）
-python3 server.py &     # 监听 127.0.0.1:4433，日志写入 server.log
-cd ../examples/h3get
-./target/release/bin/main 127.0.0.1 / 4433 insecure
+python3 -m pip install aioquic==1.8.0
+python3 interop/check.py --backend pure
+python3 interop/check.py --backend openssl
 ```
 
-## 目录结构
+手动启动本地对端时，在另一个 WSL 终端进入 `interop`，运行 `sh gen_cert.sh` 和 `python3 server.py`。上面的 `localhost` 示例使用生成的证书校验对端。
 
+## 嵌入
+
+在消费方的 `cjpm.toml` 里添加 `quic` 路径依赖。使用 OpenSSL 时同时依赖 `quic_openssl`。
+
+```cangjie
+import quic.crypto.TrustStore
+import quic.http3.Http3Client
+
+main(): Int64 {
+    let store = TrustStore.system()
+    if (let Some(client) <- Http3Client.connect("cloudflare-quic.com", 443, store, true, 8000)) {
+        try {
+            let response = client.get("/")
+            if (response.complete && response.status == 200) {
+                println(response.body.size)
+                return 0
+            }
+        } finally {
+            client.conn.closeConnection("done")
+        }
+    }
+    return 1
+}
 ```
-quic/               库（output-type = static）
-  src/crypto/       密码学原语、DER/PEM/X.509
-  src/tls/          TLS 1.3（QUIC profile）
-  src/transport/    包层（packet.cj）+ 连接状态机（conn.cj）
-  src/http3/        QPACK、H3 帧与客户端
-  testdata/         证书链、信任根、RFC 9001 黄金包十六进制
-  docs/STATUS.md    实测状态、已知缺陷、未实现清单
-examples/h3get/     命令行 HTTP/3 GET 客户端（path 依赖 quic）
-interop/            aioquic 互通服务端脚本与自签证书生成脚本
-docs/QUIC_PLAN.md   开发方案与 M0–M6 实施状态
-docs/rfc/           RFC 9000/9001/9002/9114/9204/7541/8446 原文
-```
 
-## 设计要点
+OpenSSL 路径在 `Http3Client.connect` 或 `QuicConnection.dial` 中传入 `backend: OpenSslBackend()`。直接使用 QUIC 流时，由调用方持续调用 `pollOnce()` 驱动收包和恢复定时器。单连接由一个调用方驱动。读取消费完成后可用 `extendReceiveWindow` 补充接收额度。
 
-- **自底向上**：标准库只有抽象 `Digest` / `BlockCipher` 接口，因此所有原语自实现，
-  每个原语先过官方向量（FIPS / RFC）再往上叠。
-- **测试与实现同源**：包层抽出 `PacketBuilder`，连接层和黄金包测试调用同一段代码，
-  避免"测试通过了但线上另一个实现"。
-- **同步轮询、无后台线程**：`pollOnce()` 由调用方驱动，`handshake()` 内部按 250ms 重发握手包，
-  适配 Android / Termux 等受限环境。
-- **正确性优先**：首部保护采样点、AAD 范围、length 覆盖范围等都以 RFC 9001 A.2/A.3
-  逐字节比对为准。
+验证过的连接可以通过 `session()` 取得会话状态。下一次 `dial` 可以传入该状态及相同 QUIC 版本。只有可安全重放的请求才启用 `allowEarlyData` 和 `getEarly()`。服务器拒绝早期数据时，库在验证握手后以 1-RTT 重发。推送默认关闭，可用 `allowPush()` 和 `getPush()` 显式启用与读取。
 
-## 已知限制（摘要）
+要从一个新项目验证依赖或检查 C 宿主调用，运行 `python3 examples/consumer_smoke/run.py`。
 
-- 1-RTT 无丢包重传与拥塞控制；局域网可用，丢包网络会卡住
-- 不支持 Retry、Version Negotiation、HRR/P-256 key share、RSA-PSS 验签、ChaCha20-Poly1305、
-  KeyUpdate、连接迁移、0-RTT、HTTP/3 push / GOAWAY / 动态表编码
-- `tests` 与示例使用固定信任库文件；`examples/h3get` 目前硬编码
-  `/workspace/quic/testdata/roots.pem`
-- 公网（Cloudflare）互通尚未实测
-- 性能：X25519 ≈100ms、P-256 验签 ≈345ms、SHA-256 ≈3.5MB/s，握手延迟偏高，待优化
+## 状态与实现边界
 
-完整清单（含每条的证据与建议修法）见 [`quic/docs/STATUS.md`](quic/docs/STATUS.md) §3。
-
-## 文档
-
-- [开发状态与缺口](quic/docs/STATUS.md)
-- [开发方案、架构与里程碑](docs/QUIC_PLAN.md)
-- RFC 原文：[docs/rfc/](docs/rfc/)
+两个后端均已与本地 aioquic 互通，并在 WSL 上通过系统 CA 访问 Cloudflare 公网 HTTP/3。
 
 ## 许可证
 
-本项目采用 [Apache License 2.0](LICENSE) 授权，版权归 Soffd 所有（Copyright 2026 Soffd）。
+本项目采用 [Apache License 2.0](LICENSE) 授权。
 
 ```
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -144,8 +95,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-要点：允许商用、修改与再分发；再分发时需保留版权与许可声明、标注修改过的文件；
-附带专利授权（同时禁止贡献者发起专利诉讼）。
+允许商用、修改与再分发；再分发时需保留版权与许可声明、标注修改过的文件。
 
 > 注：`docs/rfc/` 下的 RFC 原文版权归 IETF Trust，按其文档许可条款使用，
 > 不在本项目的 Apache-2.0 授权范围内。

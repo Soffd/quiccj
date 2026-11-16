@@ -1,5 +1,12 @@
 package quic.crypto
 
+import std.env.getVariable
+import std.fs.File
+import std.net.IPAddress
+import std.net.IPSocketAddress
+import std.collection.ArrayList
+import std.collection.HashSet
+
 /*
  * X.509 certificate parsing and chain verification (ECDSA P-256/P-384
  * signatures, SAN/EKU/basicConstraints handling).
@@ -9,8 +16,16 @@ public class X509Name {
     public var cn: String = ""
     public var org: String = ""
     public var full: String = ""
+    private var encoded: Array<UInt8> = []
+
+    func capture(encoded: Array<UInt8>): Unit {
+        this.encoded = encoded
+    }
 
     public func equals(o: X509Name): Bool {
+        if (encoded.size > 0 && o.encoded.size > 0) {
+            return ctEqual(encoded, o.encoded)
+        }
         return full == o.full
     }
 }
@@ -25,6 +40,7 @@ public class X509Cert {
     public var notAfter: Int64 = 0
     public var keyType: String = ""
     public var curveOid: String = ""
+    public var publicKeyDer: Array<UInt8> = []
     public var spki: Array<UInt8> = Array<UInt8>(0, repeat: 0)
     public var sigAlg: String = ""
     public var signature: Array<UInt8> = Array<UInt8>(0, repeat: 0)
@@ -36,12 +52,29 @@ public class X509Cert {
     public var keyUsagePresent: Bool = false
     public var keyUsageDigitalSignature: Bool = false
     public var basicConstraintsPresent: Bool = false
+    private var pathLen: Int64 = Int64.Max
+    private var unknownCritical = false
+    private var keyCertSign = false
+    private let ipSans = ArrayList<Array<UInt8>>()
+
+    func permitsIssuer(depth: Int64, now: Int64): Bool {
+        return isCA && depth <= pathLen && validAt(now) && !unknownCritical &&
+            (!keyUsagePresent || keyCertSign) && (!ekuPresent || ekuServerAuth)
+    }
+
+    func permitsServer(now: Int64): Bool {
+        return validAt(now) && !unknownCritical && (!ekuPresent || ekuServerAuth) &&
+            (!keyUsagePresent || keyUsageDigitalSignature)
+    }
 
     public func addSan(v: String): Unit {
-        if (sanCount < sans.size) {
-            sans[sanCount] = v
-            sanCount++
+        if (sanCount == sans.size) {
+            let previous = sans
+            sans = Array<String>(previous.size * 2, repeat: "")
+            previous.copyTo(sans)
         }
+        sans[sanCount] = v
+        sanCount++
     }
 
     public func hasSan(v: String): Bool {
@@ -60,32 +93,44 @@ public class X509Cert {
         c.der = derBytes
         let outer = Der(derBytes, 0, derBytes.size)
         let cert = outer.enter(0x30)
+        if (!outer.eof()) {
+            throw Exception("trailing DER after Certificate")
+        }
 
         let tbsStart = cert.pos
-        let tbsTlv = cert.readTLV()
+        let tbs = cert.enter(0x30)
         let tbsEnd = cert.pos
         c.tbs = sliceBytes(derBytes, tbsStart, tbsEnd - tbsStart)
 
         let sigAlg = cert.enter(0x30)
         c.sigAlg = sigAlg.readOid()
-        let sigVal = cert.readBitString()
-        c.signature = sigVal[1]
+        let (unused, signature) = cert.readBitString()
+        if (!cert.eof() || unused != 0 || signature.size == 0) {
+            throw Exception("invalid Certificate signature")
+        }
+        c.signature = signature
 
-        let tbs = Der(derBytes, tbsTlv[1], tbsTlv[1] + tbsTlv[2])
         if (tbs.peekTag() == 0xA0) {
             let v = tbs.enter(0xA0)
             let _ = v.readInt64()
         }
         c.serial = tbs.readIntegerBytes()
         let innerSig = tbs.enter(0x30)
-        let _ = innerSig.readOid()
+        if (innerSig.readOid() != c.sigAlg) {
+            throw Exception("certificate signature algorithms differ")
+        }
         c.issuer = parseName(tbs.enter(0x30))
         let validity = tbs.enter(0x30)
         c.notBefore = validity.readTime()
         c.notAfter = validity.readTime()
+        if (!validity.eof() || c.notAfter < c.notBefore) {
+            throw Exception("invalid Certificate validity")
+        }
         c.subject = parseName(tbs.enter(0x30))
 
+        let keyStart = tbs.pos
         let spki = tbs.enter(0x30)
+        c.publicKeyDer = sliceBytes(derBytes, keyStart, tbs.pos - keyStart)
         let alg = spki.enter(0x30)
         let algOid = alg.readOid()
         if (algOid == "1.2.840.10045.2.1") {
@@ -101,22 +146,41 @@ public class X509Cert {
         } else {
             c.keyType = algOid
         }
-        let key = spki.readBitString()
-        c.spki = key[1]
+        let (unusedKeyBits, publicKey) = spki.readBitString()
+        if (!spki.eof() || unusedKeyBits != 0 || publicKey.size == 0) {
+            throw Exception("invalid Certificate public key")
+        }
+        c.spki = publicKey
 
+        let extensionOids = HashSet<String>()
         while (!tbs.eof()) {
             let t = tbs.readTLV()
             if (t[0] == 0xA3) {
                 let exts = Der(derBytes, t[1], t[1] + t[2])
                 let seq = exts.enter(0x30)
+                if (!exts.eof() || seq.eof()) {
+                    throw Exception("invalid Certificate extensions")
+                }
                 while (!seq.eof()) {
                     let ext = seq.enter(0x30)
                     let oid = ext.readOid()
+                    if (extensionOids.contains(oid)) {
+                        throw Exception("duplicate Certificate extension")
+                    }
+                    extensionOids.add(oid)
+                    var critical = false
                     if (ext.peekTag() == 0x01) {
-                        ext.readTLV()
+                        let flag = ext.readContent()
+                        if (flag.size != 1 || (flag[0] != 0 && flag[0] != 0xff)) {
+                            throw Exception("invalid Certificate extension critical flag")
+                        }
+                        critical = flag[0] != 0
                     }
                     let val = ext.readOctetString()
-                    applyExtension(c, oid, val)
+                    if (!ext.eof()) {
+                        throw Exception("trailing data in Certificate extension")
+                    }
+                    applyExtension(c, oid, val, critical)
                 }
             }
         }
@@ -125,6 +189,7 @@ public class X509Cert {
 
     private static func parseName(nameSeq: Der): X509Name {
         let n = X509Name()
+        n.capture(sliceBytes(nameSeq.data, nameSeq.pos, nameSeq.end - nameSeq.pos))
         var first = true
         var full = ""
         while (!nameSeq.eof()) {
@@ -150,66 +215,63 @@ public class X509Cert {
         return n
     }
 
-    private static func applyExtension(c: X509Cert, oid: String, val: Array<UInt8>): Unit {
-        try {
-            if (oid == "2.5.29.17") {
-                let d = Der(val, 0, val.size)
-                let seq = d.enter(0x30)
-                while (!seq.eof()) {
-                    let t = seq.readTLV()
-                    if (t[0] == 0x82) {
-                        c.addSan(String.fromUtf8(sliceBytes(val, t[1], t[2])))
-                    } else if (t[0] == 0x87) {
-                        var ip = ""
-                        var i = 0
-                        while (i < t[2]) {
-                            if (i > 0) {
-                                ip = ip + "."
-                            }
-                            ip = ip + "${val[t[1] + i]}"
-                            i++
-                        }
-                        c.addSan(ip)
+    private static func applyExtension(c: X509Cert, oid: String, val: Array<UInt8>, critical: Bool): Unit {
+        let d = Der(val, 0, val.size)
+        if (oid == "2.5.29.17") {
+            let seq = d.enter(0x30)
+            while (!seq.eof()) {
+                let t = seq.readTLV()
+                if (t[0] == 0x82) {
+                    c.addSan(String.fromUtf8(sliceBytes(val, t[1], t[2])))
+                } else if (t[0] == 0x87) {
+                    if (t[2] != 4 && t[2] != 16) {
+                        throw Exception("invalid certificate IP address")
                     }
-                }
-            } else if (oid == "2.5.29.19") {
-                c.basicConstraintsPresent = true
-                let d = Der(val, 0, val.size)
-                let seq = d.enter(0x30)
-                if (!seq.eof() && seq.peekTag() == 0x01) {
-                    let b = seq.readContent()
-                    c.isCA = b[0] != 0
-                }
-            } else if (oid == "2.5.29.15") {
-                c.keyUsagePresent = true
-                let d = Der(val, 0, val.size)
-                let bs = d.readBitString()
-                if (bs[1].size > 0) {
-                    c.keyUsageDigitalSignature = (bs[1][0] & 0x80) != 0
-                }
-            } else if (oid == "2.5.29.37") {
-                c.ekuPresent = true
-                let d = Der(val, 0, val.size)
-                let seq = d.enter(0x30)
-                while (!seq.eof()) {
-                    let e = seq.readOid()
-                    if (e == "1.3.6.1.5.5.7.3.1") {
-                        c.ekuServerAuth = true
-                    }
+                    c.ipSans.add(sliceBytes(val, t[1], t[2]))
                 }
             }
-        } catch (e: Exception) {
-            // ignore malformed optional extensions
+        } else if (oid == "2.5.29.19") {
+            c.basicConstraintsPresent = true
+            let seq = d.enter(0x30)
+            if (!seq.eof() && seq.peekTag() == 0x01) {
+                c.isCA = seq.readContent()[0] != 0
+            }
+            if (!seq.eof()) {
+                c.pathLen = seq.readInt64()
+                if (!c.isCA || c.pathLen < 0 || !seq.eof()) {
+                    throw Exception("invalid certificate path length")
+                }
+            }
+        } else if (oid == "2.5.29.15") {
+            c.keyUsagePresent = true
+            let (_, bits) = d.readBitString()
+            if (bits.size > 0) {
+                c.keyUsageDigitalSignature = (bits[0] & 0x80) != 0
+                c.keyCertSign = (bits[0] & 0x04) != 0
+            }
+        } else if (oid == "2.5.29.37") {
+            c.ekuPresent = true
+            let seq = d.enter(0x30)
+            while (!seq.eof()) {
+                let e = seq.readOid()
+                if (e == "1.3.6.1.5.5.7.3.1") {
+                    c.ekuServerAuth = true
+                }
+            }
+        } else if (critical || oid == "2.5.29.30") {
+            c.unknownCritical = true
         }
     }
 
     private static func hashFor(alg: String, data: Array<UInt8>): Option<Array<UInt8>> {
-        if (alg == "1.2.840.10045.4.3.2" || alg == "1.2.840.113549.1.1.11" ||
-            alg == "1.2.840.113549.1.1.10") {
+        if (alg == "1.2.840.10045.4.3.2" || alg == "1.2.840.113549.1.1.11") {
             return Some(sha256(data))
         }
         if (alg == "1.2.840.10045.4.3.3") {
             return Some(sha384(data))
+        }
+        if (alg == "1.2.840.113549.1.1.13") {
+            return Some(sha512(data))
         }
         return None
     }
@@ -260,8 +322,19 @@ public class X509Cert {
         return now >= notBefore && now <= notAfter
     }
 
-    /** RFC 6125-style host match with single-label wildcard support. */
+    /** Match a DNS or IP subjectAltName, including single-label DNS wildcards. */
     public func matchesHost(host: String): Bool {
+        try {
+            let ip = IPAddress.parse(host)
+            for (addr in ipSans) {
+                if (IPSocketAddress(addr, 0) == IPSocketAddress(ip, 0)) {
+                    return true
+                }
+            }
+            return false
+        } catch (e: Exception) {
+            // A DNS name has no IP address representation.
+        }
         let h = toLowerAscii(host)
         var i = 0
         while (i < sanCount) {
@@ -269,9 +342,6 @@ public class X509Cert {
                 return true
             }
             i++
-        }
-        if (sanCount == 0 && subject.cn != "") {
-            return matchName(toLowerAscii(subject.cn), h)
         }
         return false
     }
@@ -317,13 +387,45 @@ public class TrustStore {
     public func addDer(der: Array<UInt8>): Unit {
         try {
             let c = X509Cert.parse(der)
-            if (count < roots.size) {
-                roots[count] = c
-                count++
+            if (count == roots.size) {
+                let expanded = Array<X509Cert>(roots.size * 2, repeat: X509Cert())
+                for (i in 0..count) {
+                    expanded[i] = roots[i]
+                }
+                roots = expanded
             }
+            roots[count] = c
+            count++
         } catch (e: Exception) {
             // skip malformed root
         }
+    }
+
+    public static func fromFile(path: String): TrustStore {
+        let store = TrustStore()
+        store.addPem(String.fromUtf8(File.readFrom(path)))
+        if (store.count == 0) {
+            throw Exception("no trusted certificates in " + path)
+        }
+        return store
+    }
+
+    /** Load the PEM CA bundle configured by SSL_CERT_FILE or installed by the OS. */
+    public static func system(): TrustStore {
+        if (let Some(path) <- getVariable("SSL_CERT_FILE")) {
+            if (path != "") {
+                return fromFile(path)
+            }
+        }
+        for (path in ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/cert.pem"]) {
+            try {
+                return fromFile(path)
+            } catch (e: Exception) {
+                // Try the next platform default.
+            }
+        }
+        throw Exception("no system PEM CA bundle; configure SSL_CERT_FILE or supply a TrustStore")
     }
 
     public func addPem(text: String): Unit {
@@ -352,47 +454,35 @@ public class TrustStore {
  * Checks signatures, validity, CA constraints, EKU and hostname.
  */
 public func verifyCertificateChain(chain: Array<X509Cert>, chainCount: Int64,
-    store: TrustStore, host: String, now: Int64): Bool {
-    if (chainCount <= 0) {
+    store: TrustStore, host: String, now: Int64,
+    backend!: CryptoBackend = PURE_CRYPTO): Bool {
+    if (chainCount <= 0 || chainCount > chain.size || chainCount > 8) {
         return false
     }
     let leaf = chain[0]
-    if (!leaf.validAt(now)) {
+    if (!leaf.permitsServer(now) || !leaf.matchesHost(host)) {
         return false
     }
-    if (leaf.ekuPresent && !leaf.ekuServerAuth) {
-        return false
+    return findChain(leaf, chain, chainCount, store, now, backend, 1, 0)
+}
+
+private func findChain(current: X509Cert, chain: Array<X509Cert>, chainCount: Int64,
+    store: TrustStore, now: Int64, backend: CryptoBackend, visited: Int64, depth: Int64): Bool {
+    for (i in 0..store.count) {
+        let anchor = store.roots[i]
+        if (ctEqual(current.der, anchor.der) ||
+            (anchor.subject.equals(current.issuer) && backend.verifyCertificate(current, anchor))) {
+            return true
+        }
     }
-    if (!leaf.matchesHost(host)) {
-        return false
-    }
-    var current = leaf
-    var depth = 0
-    while (depth < 8) {
-        let anchor = store.findIssuer(current.issuer)
-        if (anchor.isSome()) {
-            let a = anchor.getOrThrow()
-            if (current.verifySignedBy(a)) {
-                return true
-            }
+    for (i in 1..chainCount) {
+        let bit = 1 << i
+        let candidate = chain[i]
+        if ((visited & bit) == 0 && candidate.subject.equals(current.issuer) &&
+            candidate.permitsIssuer(depth, now) && backend.verifyCertificate(current, candidate) &&
+            findChain(candidate, chain, chainCount, store, now, backend, visited | bit, depth + 1)) {
+            return true
         }
-        // find an intermediate that signs `current`
-        var next = Option<X509Cert>.None
-        var i = 1
-        while (i < chainCount) {
-            let c = chain[i]
-            if (c.subject.equals(current.issuer) && c.isCA && c.validAt(now) &&
-                current.verifySignedBy(c)) {
-                next = Some(c)
-                break
-            }
-            i++
-        }
-        if (next.isNone()) {
-            return false
-        }
-        current = next.getOrThrow()
-        depth++
     }
     return false
 }

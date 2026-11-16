@@ -47,4 +47,20 @@ class PacketTest {
         @Expect(q.initialMaxData, 1000000)
         @Expect(hexEncode(q.initialSourceConnectionId), "0011223344556677")
     }
+
+    @TestCase
+    func protectedPacketSizeMatchesPacingEstimate() {
+        let cid = hexDecode("8394c8f03e515708")
+        let keys = PacketCrypto.initialSecrets(cid)[0]
+        let short = PacketBuilder.shortHeader(cid, 0, 4, keys, [1])
+        @Expect(short.size, PacketBuilder.connectionPacketSize(2, 8, 8, 0, 1, true))
+        let initial = PacketBuilder.longHeader(0, cid, cid, [1, 2, 3], 0, 4, keys, [1], 1200)
+        @Expect(initial.size, PacketBuilder.connectionPacketSize(0, 8, 8, 3, 1, false))
+        // At this target the smallest representable Length grows to two bytes.
+        let boundary = PacketBuilder.longHeader(0, cid, cid, [], 0, 4, keys, [1], 89)
+        @Expect(boundary.size, 90)
+        let decoded = PacketBuilder.openLong(boundary, keys, -1)
+        @Expect(decoded.payload[0], 1)
+    }
+
 }

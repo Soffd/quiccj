@@ -1,0 +1,9 @@
+[package]
+  cjc-version = "1.2.1"
+  name = "consumer_native"
+  version = "0.1.0"
+  output-type = "dynamic"
+
+[dependencies]
+  quic = { path = "../../../quic" }
+  quic_openssl = { path = "../../../quic_openssl" }
