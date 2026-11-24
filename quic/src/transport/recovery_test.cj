@@ -8,6 +8,27 @@ import std.unittest.testmacro.*
 @Test
 class RecoveryTest {
     @TestCase
+    func ackRangesMergeAndEvictWithoutRedelivery() {
+        let history = ReceivedPackets(256)
+        for (i in 0..160) { @Assert(history.record(i * 2), true) }
+        let sparse = ByteReader(history.encode())
+        @Expect(sparse.readU8(), 2)
+        let (ranges, _) = AckRanges.decode(sparse, 320)
+        @Expect(ranges.size, 160)
+        for (i in 0..159) { @Assert(history.record(i * 2 + 1), true) }
+        let merged = ByteReader(history.encode())
+        merged.readU8()
+        let (joined, _) = AckRanges.decode(merged, 320)
+        @Expect(joined.size, 1)
+        @Expect(joined[0].low, 0)
+        @Expect(joined[0].high, 318)
+        let bounded = ReceivedPackets(2)
+        for (pn in [0, 4, 8]) { @Expect(bounded.record(pn), true) }
+        @Expect(bounded.record(0), false)
+        @Expect(bounded.record(8), false)
+    }
+
+    @TestCase
     func disjointAckRangesDoNotAcknowledgeGap() {
         let data: Array<UInt8> = [5, 0, 1, 1, 0, 1]
         let (ranges, _) = AckRanges.decode(ByteReader(data), 6)

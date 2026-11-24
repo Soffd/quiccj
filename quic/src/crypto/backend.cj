@@ -1,7 +1,16 @@
 package quic.crypto
 
-/** Cryptographic operations selected per connection. The core defaults to pure Cangjie. */
+/** Software implementation of the per-connection cryptography interface. Select via PURE_CRYPTO. */
 public open class CryptoBackend {
+    /** ML-KEM-768 (decapsulation key, encapsulation key), when supplied by the provider. */
+    public open func mlkem768Keys(): Option<(Array<UInt8>, Array<UInt8>)> { None }
+
+    public open func mlkem768Open(key: Array<UInt8>, ciphertext: Array<UInt8>): Array<UInt8> {
+        throw Exception("ML-KEM-768 unavailable")
+    }
+
+    public open prop supportsEd25519: Bool { get() { true } }
+
     public open func digest(alg: HashAlg, message: Array<UInt8>): Array<UInt8> {
         return hashOf(alg, message)
     }
@@ -68,12 +77,20 @@ public open class CryptoBackend {
         return verifyCertificateChain(chain, count, store, host, now, backend: this)
     }
 
+    public open func verifyPeerChain(chain: Array<X509Cert>, count: Int64, store: TrustStore, host: String,
+        now: Int64, staple: Array<UInt8>): Bool {
+        return !store.requireStapledOcsp && verifyChain(chain, count, store, host, now)
+    }
+
     public open func verifyCertificate(cert: X509Cert, issuer: X509Cert): Bool {
         return cert.verifySignedBy(issuer)
     }
 
     public open func verifyHandshake(cert: X509Cert, scheme: Int64, message: Array<UInt8>,
         signature: Array<UInt8>): Bool {
+        if (scheme == 0x0807 && cert.keyType == "ED25519") {
+            return verifyEd25519(cert.spki, message, signature)
+        }
         if (scheme >= 0x0804 && scheme <= 0x0806 && cert.keyType == "RSA") {
             let alg = if (scheme == 0x0804) { HashAlg.Sha256 } else if (scheme == 0x0805) {
                 HashAlg.Sha384

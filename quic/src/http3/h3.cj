@@ -1,5 +1,6 @@
 package quic.http3
 
+import quic.tls.TlsOptions
 import quic.crypto.*
 import quic.transport.*
 import std.collection.*
@@ -351,6 +352,9 @@ class ResponseReader {
     var offset: Int64 = 0
     var lastSize: Int64 = -1
     var trailersSeen = false
+    var sink: Option<(Array<UInt8>) -> Unit> = None
+    var dataRemaining: Int64 = 0
+    var metadataBytes: Int64 = 0
 }
 
 private class PeerStream {
@@ -383,10 +387,16 @@ public class Http3Client {
     public prop qpackKnownReceivedCount: Int64 {
         get() { if (authorityAcknowledged) { 1 } else { 0 } }
     }
+    private let originPort: UInt16
+    private let responseTimeoutMs: Int64
     private let maxResponseBytes: Int64
     public var goawayId: Option<Int64> = None
 
-    public init(conn: QuicConnection, maxResponseBytes!: Int64 = 16777216) {
+    public init(conn: QuicConnection, maxResponseBytes!: Int64 = 16777216, responseTimeoutMs!: Int64 = 15000,
+        originPort!: UInt16 = conn.port) {
+        this.originPort = originPort
+        if (responseTimeoutMs <= 0) { throw Exception("HTTP/3 response timeout must be positive") }
+        this.responseTimeoutMs = responseTimeoutMs
         if (maxResponseBytes < 1) {
             throw Exception("HTTP/3 response limit must be positive")
         }
@@ -399,12 +409,14 @@ public class Http3Client {
     }
 
     public static func connect(host: String, port: UInt16, store: TrustStore,
-        verifyPeer: Bool, timeoutMs: Int64, backend!: CryptoBackend = PURE_CRYPTO): Option<Http3Client> {
-        let conn = QuicConnection.dial(host, port, store, verifyPeer, backend: backend)
-        if (!conn.handshake(timeoutMs)) {
-            return None
-        }
-        let client = Http3Client(conn)
+        verifyPeer: Bool, timeoutMs: Int64, backend!: CryptoBackend = NativeCryptoBackend(),
+        tlsOptions!: TlsOptions = TlsOptions(), config!: QuicConfig = QuicConfig(),
+        responseTimeoutMs!: Int64 = 15000): Option<Http3Client> {
+        let connected = QuicConnection.connect(host, port, store, verifyPeer, timeoutMs: timeoutMs,
+            backend: backend, config: config, tlsOptions: tlsOptions)
+        if (connected.isNone()) { return None }
+        let conn = connected.getOrThrow()
+        let client = Http3Client(conn, responseTimeoutMs: responseTimeoutMs)
         client.openControlStreams()
         return Some(client)
     }
@@ -438,30 +450,44 @@ public class Http3Client {
         if (!conn.canSendEarlyData && !conn.handshake(handshakeTimeoutMs)) {
             return HttpResponse()
         }
-        let request = sendGet(path)
+        let request = sendRequest(path, None)
         if (!conn.handshake(handshakeTimeoutMs)) {
             return HttpResponse()
         }
         return waitResponse(request)
     }
 
-    public func get(path: String): HttpResponse {
+    /** Deliver DATA incrementally. The returned response contains the status and headers. */
+    public func getStreaming(path: String, onData: (Array<UInt8>) -> Unit): HttpResponse {
+        return request(path, Some(onData))
+    }
+
+    public func get(path: String): HttpResponse { return request(path, None) }
+
+    /** Send a request body after the authenticated handshake. */
+    public func post(path: String, body: Array<UInt8>): HttpResponse {
+        if (!conn.established) { throw Exception("POST requires an established connection") }
+        return request(path, None, body: Some(body))
+    }
+
+    private func request(path: String, sink: Option<(Array<UInt8>) -> Unit>,
+        body!: Option<Array<UInt8>> = None): HttpResponse {
         openControlStreams()
         if (goawayId.isSome()) {
             let rejected = HttpResponse()
             rejected.rejected = true
             return rejected
         }
-        return waitResponse(sendGet(path))
+        return waitResponse(sendRequest(path, body), sink: sink)
     }
 
-    private func sendGet(path: String): QuicStream {
+    private func sendRequest(path: String, body: Option<Array<UInt8>>): QuicStream {
         openControlStreams()
         let req = conn.openBidiStream()
         let headers = Array<H3Header>(8, repeat: H3Header())
         let h1 = H3Header()
         h1.name = ":method"
-        h1.value = "GET"
+        h1.value = if (body.isSome()) { "POST" } else { "GET" }
         headers[0] = h1
         let h2 = H3Header()
         h2.name = ":scheme"
@@ -469,7 +495,7 @@ public class Http3Client {
         headers[1] = h2
         let h3 = H3Header()
         h3.name = ":authority"
-        h3.value = if (conn.port == 443) { host } else { "${host}:${conn.port}" }
+        h3.value = authority()
         headers[2] = h3
         let h4 = H3Header()
         h4.name = ":path"
@@ -483,14 +509,31 @@ public class Http3Client {
         } else {
             qpackEncode(headers[0..4])
         }
-        var frame = H3Frame.encode(H3Frame.HEADERS, block)
-        writeStream(req, frame, true)
+        let frame = H3Frame.encode(H3Frame.HEADERS, block)
+        writeStream(req, frame, body.isNone())
+        if (let Some(payload) <- body) {
+            let header = ByteWriter(9)
+            Varint.write(header, UInt64(H3Frame.DATA))
+            Varint.write(header, UInt64(payload.size))
+            writeStream(req, header.toArray(), false)
+            writeStream(req, payload, true)
+        }
         return req
     }
 
     private func authority(): String {
         let name = if (host.contains(":")) { "[" + host + "]" } else { host }
-        return if (conn.port == 443) { name } else { "${name}:${conn.port}" }
+        return if (originPort == 443) { name } else { "${name}:${originPort}" }
+    }
+
+    /** RFC 9218 request priority update on the client control stream. */
+    public func updatePriority(requestId: Int64, urgency: UInt8, incremental!: Bool = false): Unit {
+        if (requestId < 0 || (requestId & 3) != 0 || urgency > 7) { throw Exception("invalid HTTP priority") }
+        openControlStreams()
+        let value = ByteWriter()
+        Varint.write(value, UInt64(requestId))
+        value.putBytes(("u=" + urgency.toString() + if (incremental) { ", i" } else { "" }).toArray())
+        writeStream(controlStream, H3Frame.encode(0xf0700, value.toArray()), false)
     }
 
     /** Permit push IDs up to and including the given ID. Push is opt-in. */
@@ -716,9 +759,10 @@ public class Http3Client {
         conn.closeApplication(code, message)
     }
 
-    private func waitResponse(req: QuicStream): HttpResponse {
+    private func waitResponse(req: QuicStream, sink!: Option<(Array<UInt8>) -> Unit> = None): HttpResponse {
         let reader = ResponseReader()
-        let deadline = nowMillis() + 15000
+        reader.sink = sink
+        let deadline = nowMillis() + responseTimeoutMs
         while (!conn.closed && nowMillis() < deadline) {
             pollOnce()
             if (let Some(code) <- req.receiveReset) {
@@ -736,6 +780,7 @@ public class Http3Client {
                 fail(0x10e, e.message)
             }
             if (reader.response.complete) {
+                conn.releaseStream(req.id)
                 break
             }
         }
@@ -751,6 +796,10 @@ public class Http3Client {
     private func readResponse(stream: QuicStream, reader: ResponseReader, allowPromise: Bool): Unit {
         if (reader.response.complete || stream.receiveReset.isSome() ||
             (reader.lastSize == stream.recvBuf.size && !stream.recvFin)) {
+            return
+        }
+        if (let Some(sink) <- reader.sink) {
+            readStreamingResponse(stream, reader, sink)
             return
         }
         if (stream.recvBuf.size > maxResponseBytes) {
@@ -777,26 +826,44 @@ public class Http3Client {
         }
     }
 
-    private func readFrame(reader: ByteReader): Option<H3Frame> {
-        let start = reader.pos
-        if (!hasVarint(reader)) {
-            return None
+    private func readStreamingResponse(stream: QuicStream, reader: ResponseReader,
+        sink: (Array<UInt8>) -> Unit): Unit {
+        let input = stream.recvBuf.reader()
+        while (!input.eof()) {
+            if (reader.dataRemaining > 0) {
+                let size = if (input.remaining() < reader.dataRemaining) { input.remaining() } else { reader.dataRemaining }
+                sink(input.readBytes(size))
+                reader.dataRemaining -= size
+                continue
+            }
+            let start = input.pos
+            if (!hasVarint(input)) { break }
+            let kind = Int64(Varint.read(input))
+            if (!hasVarint(input)) { input.pos = start; break }
+            let size = Int64(Varint.read(input))
+            if (kind == H3Frame.DATA) {
+                if (reader.response.status < 200 || reader.trailersSeen) { throw Exception("unexpected HTTP/3 DATA") }
+                reader.dataRemaining = size
+            } else {
+                if (size > maxResponseBytes - reader.metadataBytes) { throw Exception("HTTP/3 metadata limit exceeded") }
+                if (size > input.remaining()) { input.pos = start; break }
+                handleResponseFrame(reader, stream.id, H3Frame(kind, input.readBytes(size)), true)
+                reader.metadataBytes += input.pos - start
+            }
         }
-        let kind = Int64(Varint.read(reader))
-        if (!hasVarint(reader)) {
-            reader.pos = start
-            return None
+        if (input.pos > 0) {
+            let remaining = input.readBytes(input.remaining())
+            stream.recvBuf.clear()
+            stream.recvBuf.putBytes(remaining)
         }
-        let length = Int64(Varint.read(reader))
-        if (length > reader.remaining()) {
-            reader.pos = start
-            return None
+        reader.lastSize = stream.recvBuf.size
+        conn.extendReceiveWindow(stream, stream.recvOff)
+        if (stream.recvFin) {
+            if (reader.dataRemaining != 0 || stream.recvBuf.size != 0 || reader.response.status < 200) {
+                throw Exception("incomplete HTTP/3 response")
+            }
+            reader.response.complete = true
         }
-        return Some(H3Frame(kind, reader.readBytes(length)))
-    }
-
-    private func hasVarint(reader: ByteReader): Bool {
-        return !reader.eof() && reader.remaining() >= (1 << (reader.data[reader.pos] >> 6))
     }
 
     private func decodeSection(payload: Array<UInt8>, sid: Int64): Array<H3Header> {
@@ -881,4 +948,26 @@ public class Http3Client {
         }
         return v
     }
+}
+
+func readFrame(reader: ByteReader): Option<H3Frame> {
+    let start = reader.pos
+    if (!hasVarint(reader)) {
+        return None
+    }
+    let kind = Int64(Varint.read(reader))
+    if (!hasVarint(reader)) {
+        reader.pos = start
+        return None
+    }
+    let length = Int64(Varint.read(reader))
+    if (length > reader.remaining()) {
+        reader.pos = start
+        return None
+    }
+    return Some(H3Frame(kind, reader.readBytes(length)))
+}
+
+func hasVarint(reader: ByteReader): Bool {
+    return !reader.eof() && reader.remaining() >= (1 << (reader.data[reader.pos] >> 6))
 }

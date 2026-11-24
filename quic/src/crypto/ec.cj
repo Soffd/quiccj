@@ -262,9 +262,20 @@ public class EcCurve {
         let w = n.fromMont(n.inverse(n.toMont(sPlain)))
         let u1 = n.fromMont(n.mul(n.toMont(e), n.toMont(w)))
         let u2 = n.fromMont(n.mul(n.toMont(rPlain), n.toMont(w)))
-        let p1 = mul(generator(), u1.toBytesBE(byteLen))
-        let p2 = mul(q, u2.toBytesBE(byteLen))
-        let sum = add(p1, p2)
+        // Joint multiplication of two public verification scalars shares the doublings.
+        let g = generator()
+        let both = add(g, q)
+        var sum = EcPoint(limbs)
+        var bit = byteLen * 8 - 1
+        while (bit >= 0) {
+            sum = double(sum)
+            if (u1.bit(bit)) {
+                sum = add(sum, if (u2.bit(bit)) { both } else { g })
+            } else if (u2.bit(bit)) {
+                sum = add(sum, q)
+            }
+            bit--
+        }
         if (sum.infinity) {
             return false
         }

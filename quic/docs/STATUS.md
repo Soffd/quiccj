@@ -1,37 +1,54 @@
 # 开发状态
 
-验证环境为 WSL Ubuntu x86_64、仓颉 1.2.1、OpenSSL 3 和 aioquic 1.8。以下结果来自 2026-11-16 的构建和互通测试。核心单测 48 项，OpenSSL 单测 3 项。aioquic 互通套件在两个后端各通过 13 项。
+本轮验证使用仓颉 1.2.1、WSL Ubuntu x86_64、OpenSSL 3.5.5 和 aioquic 1.8。验证范围截至 2026-11-24。
 
-## 已验证
+## 安全与认证
 
-| 场景 | 验证 |
+| 项目 | 行为与部署条件 |
 |---|---|
-| 核心密码学与包保护 | `quic` 单测包含 SHA、AES、X25519、ECDSA、Cloudflare 证书链、RFC 9001 Initial、Retry 和 ChaCha20 短包 |
-| OpenSSL 后端 | P-256 公钥、ECDH 和 SHA 与纯仓颉实现交叉校验。两种后端使用同一套 HTTP/3 互通脚本 |
-| 可靠传输 | 定向丢弃客户端首个长头包和第四个短头包，同时周期性丢弃和延后服务端数据报。两种后端均收到完整的 1,048,576 字节响应 |
-| 发送节奏和持续拥塞 | 在模拟 40 ms RTT 的路径上发送 16 KB 请求路径，两个后端都观察到发送因 pacing 额度不足而延后。在 1.4 秒客户端数据报连续丢弃场景中，两者均触发了一次持续拥塞并完成请求。单测覆盖跨包号空间归并、迟到 ACK、首个 RTT 样本及拥塞窗口降至 2,400 字节 |
-| TLS 与 QUIC | 两种后端均与 aioquic 完成 v1 → v2 版本协商与 Retry，以及仅 ChaCha20 套件、RSA 证书、RSA-PSS CertificateVerify 和双向发起的 1-RTT 密钥更新 |
-| P-256 HRR | TLS 测试覆盖选组、cookie 回传和握手密钥推导。另用只允许 P-256 的 OpenSSL 3.5 QUIC 服务端验证，两种后端都完成 HRR 并收到 HTTP/3 200 |
-| 连接迁移 | 在握手确认后切换本地 UDP 端口，收到新路径的 PATH_RESPONSE，再用现有连接完成 GET |
-| 0-RTT | aioquic 接受恢复与早期 GET。独立场景拒绝票据，客户端完成完整握手并以 1-RTT 重发 |
-| HTTP/3 | 在同一连接重复请求并确认 QPACK 插入，收到 PUSH_PROMISE 与推送响应，在 GOAWAY 后拒绝新的请求 |
-| 外部消费方与 C ABI | 在仓库外新建临时仓颉项目，通过路径依赖构建并收到 HTTP/3 200。独立 C 进程加载仓颉共享库，分别验证纯仓颉与 OpenSSL 后端的状态码、响应体、短缓冲区及错误 CA |
-| Cloudflare 公网 | 两种后端均使用 Ubuntu 系统 CA 验证 `cloudflare-quic.com`，通过 UDP/443 收到 HTTP/3 200 和完整 125,959 字节响应 |
+| 默认后端 | TLS、QUIC 和 HTTP/3 的连接入口默认构造 `NativeCryptoBackend`。缺少 OpenSSL 3 或必需符号时报告错误。调用方可以显式传入 `PURE_CRYPTO`，此软件实现尚未接受独立常数时间审计。 |
+| 服务器证书 | 两个后端检查有效期、SAN、CA 叶子、密钥用途和 RSA 最低 2048 位，支持 Ed25519 和 RSA-PSS 签名。设置 Unicode 主机名时通过 libidn2 转换为 A-label。 |
+| 信任根 | `TrustStore.fromFile` 对损坏的 PEM 或证书报错。`TrustStore.system()` 支持 `SSL_CERT_FILE` 与 `SSL_CERT_DIR`，也有 Linux CA bundle、Android CA 目录、Windows CryptoAPI 和 macOS SecTrust 的系统路径。 |
+| 吊销策略 | 默认关闭。`addCrlPem` 启用整条链的 CRL 检查。`requireCrl` 可要求存在有效 CRL。纯后端支持签发者直接签署的完整 CRL。OpenSSL 的 `requireStapledOcsp` 要求服务器随握手提供叶子证书的签名状态，并校验签发者、状态和有效时间。纯后端遇到强制 OCSP 策略会拒绝握手。CRL 更新由应用负责。 |
+| 客户端证书与密钥交换 | `ClientIdentity` 接受 DER 链和签名回调。`NativeCryptoBackend.signClient` 支持使用 DER 私钥。具备 ML-KEM-768 的 OpenSSL provider 会启用 X25519MLKEM768。 |
+| 时间与恢复 | 默认时钟会拒绝与进程启动后的单调时间相差超过五分钟的墙钟跳变。启动前已存在的偏差需要通过可信的 `verificationTime` 修正。票据寿命用单调时钟计算。恢复前使用当前信任根、域名和验证时钟重新检查原证书链。在 mTLS 或强制吊销策略下进行完整握手。 |
+| 秘密的生命周期 | TLS 和连接关闭时清零所持的流量密钥、密钥交换材料和 PSK。导出的 `QuicSession` 有独立的票据副本，应用负责 `destroy()`。清零范围为库持有的缓冲区，GC、系统库和调用方产生的其他副本不在此保证范围内。 |
 
-`interop/check.py` 生成受信任的测试证书。单测使用项目内的固定 RFC 和证书向量以便复现。示例的默认信任来源为系统 CA，也可传入 PEM 路径。
+## 传输与 HTTP/3
 
-## 两种密码学后端
+- `QuicConfig.parameters` 提供空闲超时、接收窗口、流数和 UDP 上限。ACK 历史按连续范围保存。可配置 ACK 间隔、范围数、每轮读取量、保活及发送 MTU。Linux 支持 `recvmmsg`、可用时启用 UDP GRO、验证 ECN 反馈，以带填充的 PING 和已认证的 ACK 探测路径 MTU。其他目标使用标准库 UDP，发送 MTU 为 1200。
+- 客户端可切换本地 UDP 绑定并验证新路径。代理在传输期间切换对服务器可见的客户端端口时，原连接仍能下载完整响应。客户端会过滤来自未知服务器地址的包。服务端 preferred address 尚未实现。[RFC 9000 §9](https://www.rfc-editor.org/rfc/rfc9000.html#section-9)
+- `closeConnection` 同步保留套接字三个 PTO，closing 期间可限速重发 CONNECTION_CLOSE，draining 期间保持静默。单连接由一个调用方驱动，保活和恢复定时器依赖轮询。
+- `QuicConnection.connect` 和 `Http3Client.connect` 在系统 DNS 返回后交错尝试 IPv6/IPv4 地址。需要控制 0-RTT 和版本的低层 `dial` 返回单地址连接对象。高层 HTTP/3 支持 GET、带请求体的 POST、推送、流式响应、PRIORITY_UPDATE 及连接池。`Http3Pool` 复用经过验证的同源连接，支持带有效期的 h3 Alt-Svc，通过替代端点连接时保留源站身份及请求 authority。
+- `QuicConfig.onDatagram` 与 `sendDatagram` 提供 RFC 9221 不可靠数据报。WebTransport 会话尚未实现。POST 使用经过认证的 1-RTT 连接。
+- 可读指标包含 RTT、拥塞窗口、在途字节、丢包、流数和收发字节。`closeCause` 提供结构化关闭原因。`QuicConfig.qlog` 接收 JSON-SEQ 包事件，`log` 接收诊断文本，`TlsOptions.keyLog` 生成 NSS 密钥日志。这些回调默认关闭。
 
-`quic` 默认选择 `PURE_CRYPTO`。纯仓颉实现适合必须保持无 FFI 依赖的调用方。其密码学算术尚未做独立的常数时间审计。纯仓颉 X.509 实现校验证书链、SAN、时间、基本约束和密钥用途，对不支持的关键扩展采取拒绝策略。
+## 验证矩阵
 
-可选包 `quic_openssl` 通过 OpenSSL 3 的 EVP 和 X.509 接口执行密码学和证书路径验证。它适用于需要性能或更完整 X.509 支持的 Linux 应用。应用可按连接显式选择，无需重新编译核心包。
+| 场景 | 已执行的验证 |
+|---|---|
+| Linux / aioquic | 两个后端各 21 项，覆盖显式后端选择与动态库缺失、RSA-1024、CA 叶子、信任失败、1 MiB POST 的端到端 SHA-256 校验、1 MiB 流式下载、丢包乱序、重绑定、显式迁移、ACK 驱动的 MTU 探测、DATAGRAM 回显、Alt-Svc 的原始 authority 和连接复用、QPACK、GOAWAY、0-RTT 接受与拒绝、版本协商、Retry 和密钥更新。 |
+| Linux / nginx QUIC | 强制客户端证书，服务端只接受混合组；Ed25519 叶子、RSA-PSS 签名的链、有效 CRL、签名 OCSP staple 均成功。拒绝撤销证书、过期 CRL 和缺失的客户端身份。 |
+| Linux / ngtcp2 与 quiche | 两个后端对 ngtcp2 完成可信 GET 并拒绝已撤销的叶子。OpenSSL 对 ngtcp2 拒绝缺失的强制 OCSP staple，并对 Cloudflare quiche 完成可信 GET。 |
+| Windows x86_64 / Kestrel、MsQuic | 从 Linux 交叉编译，在 Windows 上用两个后端及显式 PEM 信任根完成 HTTP/3 GET。两个后端使用 Windows 系统信任库验证固定公网证书链时，正确域名通过，错误域名被拒绝。Chrome、Firefox 和启用 HTTP/3 的 curl 对同一 MsQuic 服务也收到了 HTTP/3 响应。 |
+| 外部消费方 | 仓库外仓颉项目及独立 C 宿主完成 GET；C ABI 测试覆盖错误 CA 与短缓冲区。 |
+| macOS、Android | 已加入平台代码。尚缺目标系统上的构建、证书库及网络互通实测。 |
 
-本机 ECDSA 信任根验证握手各运行七次。纯仓颉耗时中位数 315 ms，OpenSSL 为 9 ms。计时涵盖 `dial` 和握手，后端初始化与 CA 文件读取在计时前完成。
+55 项核心测试和 3 项 OpenSSL 兼容包测试全部通过。核心单测包括 RFC 向量、错误 Finished、TLS 降级、证书过期、错误 SAN、链断裂、通配符边界、畸形信任根，以及四种解析器的可复现变异测试。覆盖率命令独立构建带覆盖率计数的包，要求生产源代码行覆盖率至少 52%。本轮使用 16,384 个变异输入，实测 53.38%（3,684/6,901 行）。本机使用四个并发客户端进程，每条连接连续发起 8,192 次 GET。最终轮转队列在 309.7 秒内完成 64 条连接、524,288 次成功 GET，该负载下 OpenSSL 握手中位数为 15 ms。在另一次顺序基准中，每个后端独立计时七次本机完整握手，纯仓颉中位数为 141 ms，OpenSSL 为 9 ms。短时压力测试尚未覆盖数小时运行、移动网络和设备能耗。
 
-## 实现边界
+## 复现
 
-- 单连接由一个调用方同步驱动。高层 HTTP/3 API 提供 GET 与整段响应缓冲，默认上限 16 MiB，可通过 `Http3Client` 构造参数配置。QUIC 服务端、HTTP/3 通用请求和流式响应属于后续接口工作。
-- pacer 按拥塞窗口与平滑 RTT 补充发送额度，限制空闲后突发，并由同步轮询驱动。纯 ACK、PTO 探测与即时路径验证响应走各自的发送路径。持续拥塞依赖最近 4,096 条本路径发送记录，证据不完整的区间会被截断。路径 MTU 探测仍待实现。
-- 版本协商使用带认证版本参数的 v1/v2 重试。迁移验证的对象是本地 UDP 绑定，远端地址由 `dial` 确定。服务端 preferred address 和自动换路仍待实现。
-- 目前 QPACK 请求编码器插入和复用 `:authority`。推送由应用按连接启用。会话状态是进程内对象，调用方需要显式声明早期请求可以重放。
-- 公网验证覆盖上述 Cloudflare 端点。跨平台和更多实现的互通矩阵仍待扩充。
+```bash
+(cd quic && cjpm test)
+(cd quic_openssl && cjpm test)
+(cd examples/h3get && cjpm build)
+python3 interop/coverage.py
+python3 interop/check.py --backend openssl
+python3 interop/check.py --backend pure
+python3 interop/secure_handshake.py --nginx /path/to/nginx --ngtcp2 /path/to/gtlsserver --quiche /path/to/quiche-server
+python3 interop/benchmark.py --backend pure --samples 7
+python3 interop/benchmark.py --backend openssl --concurrency 4 --requests 8192 --seconds 300
+python3 examples/consumer_smoke/run.py
+```
+
+运行更长的稳态压测时可增加 `--seconds`。Linux 网络测试依赖 aioquic 1.8、cryptography 和 openssl 命令。nginx 需要 HTTP/3、OpenSSL 混合组和 stapling 支持。Windows 上运行 `python interop/msquic.py --client C:\path\to\main.exe`，需 .NET 8、仓颉运行库和 OpenSSL 3 DLL。变异测试可通过 `QUICCJ_FUZZ_CASES`、`QUICCJ_FUZZ_SEED` 设置次数和种子。浏览器对照可给 `msquic.py` 传入 `--chrome`、`--curl` 或 `--firefox`。Firefox 测试需要 Playwright 和 Mozilla NSS 的 `certutil`，用 `--nss-certutil` 指定工具，在临时配置中导入测试 CA。脚本要求服务端报告 HTTP/3，降级到 HTTP/2 会使测试失败。

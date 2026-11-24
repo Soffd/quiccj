@@ -48,7 +48,7 @@ private func rsaPublic(key: Array<UInt8>, signature: Array<UInt8>): (Array<UInt8
     let seq = der.enter(0x30)
     let modulus = seq.readIntegerBytes()
     let exponent = seq.readIntegerBytes()
-    if (!der.eof() || !seq.eof() || modulus.size < 128 || modulus.size > 1024 ||
+    if (!der.eof() || !seq.eof() || modulus.size < 256 || modulus.size > 1024 ||
         exponent.size == 0 || exponent.size > 8 || signature.size != modulus.size) {
         throw Exception("invalid RSA parameters")
     }
@@ -56,7 +56,7 @@ private func rsaPublic(key: Array<UInt8>, signature: Array<UInt8>): (Array<UInt8
     let n = BigUint.fromBytesBE(modulus, limbs)
     let e = BigUint.fromBytesBE(exponent, limbs)
     let s = BigUint.fromBytesBE(signature, limbs)
-    if (!n.isOdd() || !e.isOdd() || e.bitLen() < 2 || s.cmp(n) >= 0) {
+    if (n.bitLen() < 2048 || !n.isOdd() || !e.isOdd() || e.bitLen() < 2 || s.cmp(n) >= 0) {
         throw Exception("invalid RSA public operation")
     }
     let ctx = MontCtx(n.w, limbs)

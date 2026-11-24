@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import re
 import contextlib
+import os
+import hashlib
 from pathlib import Path
 import socket
 import subprocess
@@ -84,6 +86,35 @@ class LossProxy(asyncio.DatagramProtocol):
         self.transport.sendto(data, self.server)
 
 
+class RebindingProxy(asyncio.DatagramProtocol):
+    """Stable client-facing address with two distinct, locally bound upstream UDP ports."""
+
+    def __init__(self):
+        self.client = None
+        self.short_packets = 0
+        self.upstreams = []
+        self.switched = False
+
+    def connection_made(self, transport):
+        self.front = transport
+
+    def datagram_received(self, data, addr):
+        self.client = addr
+        if not data[0] & 0x80:
+            self.short_packets += 1
+        self.switched = self.short_packets >= 5
+        self.upstreams[int(self.switched)].sendto(data)
+
+    def upstream(self):
+        proxy = self
+
+        class Upstream(asyncio.DatagramProtocol):
+            def datagram_received(self, data, addr):
+                proxy.front.sendto(data, proxy.client)
+
+        return Upstream()
+
+
 class DelayedPath(asyncio.DatagramProtocol):
     """A fixed-RTT path with an optional blackout during a multi-packet request."""
 
@@ -120,23 +151,27 @@ class DelayedPath(asyncio.DatagramProtocol):
 async def check(client, backend):
     with tempfile.TemporaryDirectory(prefix="quiccj-") as tmp:
         directory = Path(tmp)
-        for algorithm, key, cert in (
-            ("ec", "key.pem", "cert.pem"),
-            ("rsa:2048", "rsa-key.pem", "rsa.pem"),
+        for algorithm, key, cert, ca_flag in (
+            ("ec", "key.pem", "cert.pem", False),
+            ("rsa:2048", "rsa-key.pem", "rsa.pem", False),
+            ("rsa:1024", "weak-key.pem", "weak.pem", False),
+            ("ec", "ca-key.pem", "ca-leaf.pem", True),
         ):
             curve = ["-pkeyopt", "ec_paramgen_curve:prime256v1"] if algorithm == "ec" else []
             subprocess.run(
                 ["openssl", "req", "-x509", "-newkey", algorithm, *curve,
                  "-nodes", "-keyout", key, "-out", cert, "-days", "1", "-subj",
-                 "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
+                 "/CN=localhost", "-addext", f"basicConstraints=critical,CA:{str(ca_flag).upper()}", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
                 cwd=directory, check=True, capture_output=True,
             )
 
         async def get(port, label, path="/", ca="cert.pem", *, repeat=1, mode="", code=0,
-                      expected=(), recovery_check=None):
+                      expected=(), recovery_check=None, env=None, default_backend=False):
             proc = await asyncio.create_subprocess_exec(
                 str(client), "127.0.0.1", path, str(port), str(directory / ca),
-                backend, str(repeat), mode,
+                *([] if default_backend else [backend, str(repeat), mode]),
+                env={**os.environ, **(env or {}), **({"QUICCJ_SEND_MTU": "1452"}
+                    if mode == "transport" and sys.platform.startswith("linux") else {})},
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             )
             try:
@@ -153,8 +188,29 @@ async def check(client, backend):
             print(f"PASS {backend} {label}", flush=True)
 
         async with server(directory) as port:
+            missing_library = {"QUICCJ_LIBCRYPTO": str(directory / "missing-library")}
+            if backend == "openssl":
+                await get(port, "default backend fails closed when OpenSSL is missing", env=missing_library,
+                          default_backend=True, code=1, expected=("HTTP/3 GET", "OpenSSL 3 unavailable"))
+            else:
+                await get(port, "explicit software backend loads with OpenSSL absent", env=missing_library,
+                          expected=("status: 200 complete=true",))
             await get(port, "verified GET and QPACK reuse", repeat=3,
                       expected=("status: 200 complete=true", "body bytes: 22", "qpack_known_received=1"))
+            await get(port, "pooled alternative preserves authority and reuses the connection", mode="pool",
+                      expected=("pool reused alternative with original authority",))
+            def check_mtu(output):
+                mtu = int(re.search(r"validated_mtu=(\d+)", output)[1])
+                if sys.platform.startswith("linux") and mtu <= 1200:
+                    raise AssertionError(f"no larger probe acknowledged (MTU {mtu})")
+            await get(port, "QUIC DATAGRAM echo and path MTU probe", mode="transport",
+                      expected=("datagram_echo_bytes=3",), recovery_check=check_mtu)
+            pattern = bytes(range(251))
+            digest = hashlib.sha256((pattern * (1048576 // len(pattern) + 1))[:1048576]).hexdigest()
+            await get(port, "1 MiB POST with end-to-end digest", "/upload", mode="upload",
+                      expected=("status: 200 complete=true", digest))
+            await get(port, "streaming 1 MiB DATA", "/large", mode="stream",
+                      expected=("status: 200 complete=true", "streamed bytes: 1048576", "body bytes: 0"))
             await get(port, "untrusted certificate rejected", ca="rsa.pem", code=1,
                       expected=("handshake=false", "certificate verification failed"))
             await get(port, "server push", "/push", mode="push",
@@ -168,6 +224,20 @@ async def check(client, backend):
             await get(port, "0-RTT accepted", mode="resume",
                       expected=("resumed=true early_accepted=true complete=true status=200",))
             loop = asyncio.get_running_loop()
+            rebinding = RebindingProxy()
+            front, _ = await loop.create_datagram_endpoint(lambda: rebinding, local_addr=("127.0.0.1", 0))
+            try:
+                for _ in range(2):
+                    upstream, _ = await loop.create_datagram_endpoint(rebinding.upstream, remote_addr=("127.0.0.1", port))
+                    rebinding.upstreams.append(upstream)
+                await get(front.get_extra_info("sockname")[1], "client NAT rebinding", "/large",
+                          expected=("status: 200 complete=true", "body bytes: 1048576"))
+                if not rebinding.switched:
+                    raise AssertionError("client source port did not change")
+            finally:
+                for upstream in rebinding.upstreams:
+                    upstream.close()
+                front.close()
             proxy = LossProxy(port)
             transport, _ = await loop.create_datagram_endpoint(
                 lambda: proxy, local_addr=("127.0.0.1", 0)
@@ -208,6 +278,10 @@ async def check(client, backend):
                               recovery_check=check_recovery)
                 finally:
                     transport.close()
+        for label, cert, key in [("RSA-1024 rejected", "weak.pem", "weak-key.pem"),
+                                 ("CA certificate rejected as TLS leaf", "ca-leaf.pem", "ca-key.pem")]:
+            async with server(directory, "--cert", cert, "--key", key) as port:
+                await get(port, label, ca=cert, code=1, expected=("certificate verification failed",))
         async with server(directory, "--reject-resumption") as port:
             await get(port, "0-RTT rejected and replayed as 1-RTT", mode="resume",
                       expected=("resumed=false early_accepted=false complete=true status=200",))

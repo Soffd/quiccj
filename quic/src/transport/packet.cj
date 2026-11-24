@@ -97,6 +97,10 @@ public class PacketKeys {
         this.version = version
     }
 
+    func destroy(): Unit {
+        for (bytes in [key, iv, hp, secret]) { fillBytes(bytes, 0) }
+    }
+
     public static func copyOf(o: PacketKeys): PacketKeys {
         return PacketKeys(o.key, o.iv, o.hp, secret: o.secret, chacha: o.chacha, backend: o.backend, version: o.version)
     }
@@ -379,7 +383,7 @@ private let INITIAL_SALT: String = "38762cf7f55934b34d179ae6a4c80cadccbb7f0a"
 public class PacketCrypto {
     /** RFC 9001 section 5.8 integrity tag over ODCID and the complete Retry header. */
     public static func verifyRetry(originalDcid: Array<UInt8>, packet: Array<UInt8>,
-        version!: UInt32 = QUIC_V1): Bool {
+        version!: UInt32 = QUIC_V1, backend!: CryptoBackend = PURE_CRYPTO): Bool {
         if (packet.size < 16 || originalDcid.size > 20) {
             return false
         }
@@ -392,7 +396,7 @@ public class PacketCrypto {
         let nonce = hexDecode(if (version == QUIC_V2) { "d86969bc2d7c6d9990efb04a" } else {
             "461599d35d632bf2239825bb"
         })
-        return AesGcm(key).open(nonce, pseudo.toArray(), [], 0, 0, packet, packet.size - 16)
+        return backend.openPacket(false, key, nonce, pseudo.toArray(), packet, packet.size - 16, 0, packet.size - 16)
     }
 
     public static func initialSecrets(dcid: Array<UInt8>, backend!: CryptoBackend = PURE_CRYPTO,
@@ -433,14 +437,14 @@ public class PacketCrypto {
         let secret = hkdfExpandLabel(alg, cur.secret, prefix + "ku", [], hashSize(alg), backend: backend)
         let key = hkdfExpandLabel(alg, secret, prefix + "key", [], keyLen, backend: backend)
         let iv = hkdfExpandLabel(alg, secret, prefix + "iv", [], 12, backend: backend)
-        return PacketKeys(key, iv, cur.hp, secret: secret, chacha: cur.chacha, backend: backend, version: cur.version)
+        return PacketKeys(key, iv, cur.hp.clone(), secret: secret, chacha: cur.chacha, backend: backend, version: cur.version)
     }
 }
 
 /** Transport parameters (RFC 9000 §18). */
 public class TransportParams {
     public var maxIdleTimeout: UInt64 = 30000
-    public var maxUdpPayloadSize: UInt64 = 1200
+    public var maxUdpPayloadSize: UInt64 = 65527
     public var initialMaxData: UInt64 = 1048576
     public var initialMaxStreamDataBidiLocal: UInt64 = 262144
     public var initialMaxStreamDataBidiRemote: UInt64 = 262144

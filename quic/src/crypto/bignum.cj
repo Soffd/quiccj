@@ -269,6 +269,7 @@ public class BigUint {
 public class MontCtx {
     public let k: Int64
     public let mod: Array<UInt32>
+    private let modulusValue: BigUint
     private let n0inv: UInt32
     public let r2: BigUint
 
@@ -304,6 +305,7 @@ public class MontCtx {
             m.w[i] = mod[i]
             i++
         }
+        modulusValue = m
         var step = 0
         while (step < 2 * 32 * k) {
             r.shl1()
@@ -371,13 +373,7 @@ public class MontCtx {
         }
         res.n = k + 1
         res.trim()
-        let m = BigUint(k + 2)
-        m.n = k
-        i = 0
-        while (i < k) {
-            m.w[i] = mod[i]
-            i++
-        }
+        let m = modulusValue
         if (res.cmp(m) >= 0) {
             res.sub(m)
         }
@@ -406,13 +402,7 @@ public class MontCtx {
         if (a.isZero()) {
             return BigUint(k + 2)
         }
-        let m = BigUint(k + 2)
-        m.n = k
-        var i = 0
-        while (i < k) {
-            m.w[i] = mod[i]
-            i++
-        }
+        let m = modulusValue
         let r = m.clone()
         r.sub(a)
         return r
@@ -421,13 +411,7 @@ public class MontCtx {
     public func add(a: BigUint, b: BigUint): BigUint {
         let r = a.clone()
         r.add(b)
-        let m = BigUint(k + 2)
-        m.n = k
-        var i = 0
-        while (i < k) {
-            m.w[i] = mod[i]
-            i++
-        }
+        let m = modulusValue
         if (r.cmp(m) >= 0) {
             r.sub(m)
         }
@@ -439,13 +423,7 @@ public class MontCtx {
         if (r.cmp(b) >= 0) {
             r.sub(b)
         } else {
-            let m = BigUint(k + 2)
-            m.n = k
-            var i = 0
-            while (i < k) {
-                m.w[i] = mod[i]
-                i++
-            }
+            let m = modulusValue
             r.add(m)
             r.sub(b)
         }
@@ -478,16 +456,14 @@ public class MontCtx {
     /** base^exp in Montgomery form. */
     @OverflowWrapping
     public func pow(base: BigUint, exp: BigUint): BigUint {
-        var result = one()
-        var b = base.clone()
-        var i = 0
         let bits = exp.bitLen()
-        while (i < bits) {
-            if (exp.bit(i)) {
-                result = mul(result, b)
-            }
-            b = mul(b, b)
-            i++
+        if (bits == 0) { return one() }
+        var result = base.clone()
+        var i = bits - 2
+        while (i >= 0) {
+            result = mul(result, result)
+            if (exp.bit(i)) { result = mul(result, base) }
+            i--
         }
         return result
     }

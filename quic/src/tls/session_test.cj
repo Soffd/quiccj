@@ -1,6 +1,7 @@
 package quic.tls
 
 import quic.crypto.*
+import std.fs.File
 import std.unittest.*
 import std.unittest.testmacro.*
 
@@ -94,6 +95,60 @@ class TlsRetryTest {
         client.onData([0, 0], cryptoSpace: 0)
         @Expect(client.state, 7)
         @Expect(client.failure.contains("wrong QUIC encryption level"), false)
+    }
+
+    @TestCase
+    func downgradeAndWrongFinishedAreRejected() {
+        let downgrade = TlsClient("localhost", "h3", [1], TrustStore(), false)
+        downgrade.start()
+        downgrade.onData(serverHello(Array<UInt8>(32, repeat: 1), [0, 43, 0, 2, 3, 3]))
+        @Expect(downgrade.state, 7)
+        @Expect(downgrade.failure.contains("TLS 1.3"), true)
+
+        let chain = pemCertificates(String.fromUtf8(File.readFrom("testdata/chain.pem")))
+        let host = "cloudflare-quic.com"
+        let store = TrustStore()
+        store.addDer(chain[2])
+        let ticket = TlsTicket(host, "h3", [1], Array<UInt8>(32, repeat: 42), 0x1301, 0, 60, false,
+            [X509Cert.parse(chain[0]), X509Cert.parse(chain[1])])
+        let options = TlsOptions(verificationTime: { => 1794773559 })
+        let noTrust = TlsClient(host, "h3", [1], TrustStore(), true, ticket: Some(ticket), options: options)
+        let expired = TlsClient(host, "h3", [1], store, true, ticket: Some(ticket),
+            options: TlsOptions(verificationTime: { => 2000000000 }))
+        for (rejected in [noTrust, expired]) {
+            let hello = rejected.start()
+            let body = ByteReader(hello, 4, hello.size)
+            body.readBytes(34)
+            body.readVec8()
+            body.readVec16()
+            body.readVec8()
+            let extensions = ByteReader(body.readVec16())
+            while (!extensions.eof()) {
+                @Expect(extensions.readU16() == 41, false)
+                extensions.readVec16()
+            }
+            rejected.destroy()
+        }
+        let client = TlsClient(host, "h3", [1], store, true, ticket: Some(ticket), options: options)
+        client.start()
+        let exts = ByteWriter()
+        exts.putBytes([0, 43, 0, 2, 3, 4, 0, 41, 0, 2, 0, 0])
+        let pub = Array<UInt8>(32, repeat: 0)
+        pub[0] = 9
+        exts.putBytes([0, 51, 0, 36, 0, 29, 0, 32])
+        exts.putBytes(pub)
+        client.onData(serverHello(Array<UInt8>(32, repeat: 1), exts.toArray()))
+        @Assert(client.state, 2)
+        client.onData([8, 0, 0, 16, 0, 14, 0, 16, 0, 5, 0, 3, 2, 104, 51, 0, 57, 0, 1, 0])
+        @Assert(client.state, 3)
+        let traffic = client.serverHs.secret
+        client.onData(concat([20, 0, 0, 32], Array<UInt8>(32, repeat: 0)))
+        @Expect(client.failure.contains("Finished"), true)
+        @Expect(client.handshakeComplete, false)
+        @Expect(ctEqual(traffic, Array<UInt8>(32, repeat: 0)), true)
+        @Expect(ticket.usable(host, "h3"), true)
+        ticket.destroy()
+        @Expect(ticket.usable(host, "h3"), false)
     }
 
     private func serverHello(random: Array<UInt8>, extensions: Array<UInt8>): Array<UInt8> {

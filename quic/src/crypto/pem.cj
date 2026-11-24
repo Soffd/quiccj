@@ -32,17 +32,21 @@ public func base64Decode(text: String): Array<UInt8> {
     var o = 0
     var acc: UInt32 = 0
     var bits = 0
+    var padding = 0
+    var digits = 0
     var i = 0
     while (i < raw.size) {
         let c = raw[i]
         i++
+        if (c == 32 || c == 9 || c == 10 || c == 13) { continue }
         if (c == 61) {
-            break
-        }
-        let v = b64Val(c)
-        if (v < 0) {
+            padding++
+            if (padding > 2) { throw Exception("invalid base64 padding") }
             continue
         }
+        let v = b64Val(c)
+        if (v < 0 || padding > 0) { throw Exception("invalid base64") }
+        digits++
         acc = (acc << 6) | UInt32(v)
         bits = bits + 6
         if (bits >= 8) {
@@ -50,6 +54,9 @@ public func base64Decode(text: String): Array<UInt8> {
             out[o] = UInt8((acc >> UInt32(bits)) & 0xFF)
             o++
         }
+    }
+    if ((digits + padding) % 4 != 0 || (bits > 0 && (acc & ((1u32 << bits) - 1)) != 0)) {
+        throw Exception("incomplete base64 group")
     }
     return sliceBytes(out, 0, o)
 }
@@ -99,10 +106,14 @@ private func matchAt(data: Array<UInt8>, off: Int64, pat: Array<UInt8>): Bool {
 
 /** Extract all CERTIFICATE blocks from a PEM bundle. */
 public func pemCertificates(text: String): Array<Array<UInt8>> {
+    return pemBlocks(text, "CERTIFICATE")
+}
+
+func pemBlocks(text: String, label: String): Array<Array<UInt8>> {
     let raw = text.toArray()
     let out = ArrayList<Array<UInt8>>()
-    let begin = "-----BEGIN CERTIFICATE-----".toArray()
-    let endMark = "-----END CERTIFICATE-----".toArray()
+    let begin = ("-----BEGIN " + label + "-----").toArray()
+    let endMark = ("-----END " + label + "-----").toArray()
     var i = 0
     while (i + begin.size <= raw.size) {
         if (matchAt(raw, i, begin)) {
@@ -116,7 +127,7 @@ public func pemCertificates(text: String): Array<Array<UInt8>> {
                 j++
             }
             if (e < 0) {
-                break
+                throw Exception("unterminated PEM " + label)
             }
             let b64 = String.fromUtf8(sliceBytes(raw, i + begin.size, e - (i + begin.size)))
             out.add(base64Decode(b64))

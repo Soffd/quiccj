@@ -1,27 +1,39 @@
 package quic.crypto
 
-import std.fs.*
+@When[os != "Windows"]
+foreign func getentropy(output: CPointer<UInt8>, length: UIntNative): Int32
 
-/** Linux and Android OS randomness. A failed CSPRNG read fails the connection. */
+@When[os == "Windows"]
+foreign func rand_s(output: CPointer<UInt32>): Int32
+
+/** Read directly from the operating system CSPRNG. */
+@When[os != "Windows"]
 public func randomBytes(n: Int64): Array<UInt8> {
     let out = Array<UInt8>(n, repeat: 0)
-    if (n == 0) {
-        return out
-    }
-    let file = File("/dev/urandom", OpenMode.Read)
-    try {
-        var offset = file.read(out)
-        while (offset < n) {
-            let rest = Array<UInt8>(n - offset, repeat: 0)
-            let count = file.read(rest)
-            if (count <= 0) {
-                throw Exception("OS randomness unavailable")
+    unsafe {
+        let data = acquireArrayRawData(out)
+        try {
+            var offset = 0
+            while (offset < n) {
+                let size = if (n - offset > 256) { 256 } else { n - offset }
+                if (getentropy(data.pointer + offset, UIntNative(size)) != 0) {
+                    throw Exception("OS random generator failed")
+                }
+                offset += size
             }
-            copyBytes(out, offset, rest, 0, count)
-            offset += count
-        }
-        return out
-    } finally {
-        file.close()
+        } finally { releaseArrayRawData(data) }
     }
+    return out
+}
+
+@When[os == "Windows"]
+public func randomBytes(n: Int64): Array<UInt8> {
+    let out = Array<UInt8>(n, repeat: 0)
+    var word: UInt32 = 0
+    for (i in 0..n) {
+        if (i % 4 == 0 && unsafe { rand_s(inout word) } != 0) { throw Exception("OS random generator failed") }
+        out[i] = UInt8(word & 255)
+        word >>= 8
+    }
+    return out
 }

@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import logging
+import hashlib
 
 import pylsqpack
 
@@ -10,10 +11,10 @@ from aioquic.asyncio import serve
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.buffer import encode_uint_var
 from aioquic.h3.connection import FrameType, H3Connection, encode_frame
-from aioquic.h3.events import HeadersReceived
+from aioquic.h3.events import DataReceived, HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.packet import QuicProtocolVersion
-from aioquic.quic.events import HandshakeCompleted
+from aioquic.quic.events import DatagramFrameReceived, HandshakeCompleted
 from aioquic.tls import CipherSuite
 
 
@@ -32,13 +33,27 @@ class InteropProtocol(QuicConnectionProtocol):
         super().__init__(*args, **kwargs)
         self.h3 = InteropH3(self._quic)
         self.key_update = False
+        self.requests = 0
+        self.uploads = {}
 
     def quic_event_received(self, event):
+        if isinstance(event, DatagramFrameReceived):
+            self._quic.send_datagram_frame(event.data)
+            return
         if isinstance(event, HandshakeCompleted):
             self.key_update = config.key_update
         for request in self.h3.handle_event(event):
             if isinstance(request, HeadersReceived):
-                self.respond(request)
+                if dict(request.headers).get(b":method") == b"POST":
+                    self.uploads[request.stream_id] = hashlib.sha256()
+                else:
+                    self.respond(request)
+            if isinstance(request, DataReceived) and request.stream_id in self.uploads:
+                self.uploads[request.stream_id].update(request.data)
+                if request.stream_ended:
+                    digest = self.uploads.pop(request.stream_id).hexdigest().encode()
+                    self.h3.send_headers(request.stream_id, [(b":status", b"200")])
+                    self.h3.send_data(request.stream_id, digest, end_stream=True)
 
     def respond(self, request):
         headers = dict(request.headers)
@@ -73,7 +88,10 @@ class InteropProtocol(QuicConnectionProtocol):
                 self.h3._local_control_stream_id,
                 encode_frame(FrameType.GOAWAY, encode_uint_var(request.stream_id + 4)),
             )
+        self.requests += 1
         body = b"hello from aioquic h3\n"
+        if path == b"/authority":
+            body = headers[b":authority"] + b" " + str(self.requests).encode()
         if path == b"/large":
             body = b"0123456789abcdef" * 65536
         self.h3.send_headers(
@@ -84,7 +102,7 @@ class InteropProtocol(QuicConnectionProtocol):
 
 
 async def main():
-    cfg = QuicConfiguration(is_client=False, alpn_protocols=["h3"])
+    cfg = QuicConfiguration(is_client=False, alpn_protocols=["h3"], max_datagram_frame_size=1200)
     cfg.load_cert_chain(config.cert, config.key)
     if config.chacha:
         cfg.cipher_suites = [CipherSuite.CHACHA20_POLY1305_SHA256]

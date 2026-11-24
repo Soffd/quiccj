@@ -13,7 +13,13 @@ import std.time.*
 
 public class QuicStream {
     public var id: Int64 = 0
-    public var sendBuf: Array<UInt8> = Array<UInt8>(0, repeat: 0)
+    var scheduled = false
+    var earlyRegistered = false
+    let outgoing = ByteWriter(1)
+    public mut prop sendBuf: Array<UInt8> {
+        get() { return outgoing.reader().data[0..outgoing.size] }
+        set(bytes) { outgoing.clear(); outgoing.putBytes(bytes) }
+    }
     public var sendOff: Int64 = 0
     public var ackedOff: Int64 = 0
     public var finSent: Bool = false
@@ -38,6 +44,8 @@ public class QuicSession {
     let tlsTicket: TlsTicket
     let transportParams: Array<UInt8>
 
+    public func destroy(): Unit { tlsTicket.destroy() }
+
     init(port: UInt16, version: UInt32, tlsTicket: TlsTicket, transportParams: Array<UInt8>) {
         this.port = port
         this.version = version
@@ -57,13 +65,13 @@ private class ConnectionId {
 }
 
 private class PathProbe {
-    let socket: UdpSocket
+    let socket: QuicSocket
     let sequence: UInt64
     let connectionId: Array<UInt8>
     let challenge: Array<UInt8>
     var validated = false
 
-    init(socket: UdpSocket, sequence: UInt64, connectionId: Array<UInt8>) {
+    init(socket: QuicSocket, sequence: UInt64, connectionId: Array<UInt8>) {
         this.socket = socket
         this.sequence = sequence
         this.connectionId = connectionId
@@ -71,10 +79,86 @@ private class PathProbe {
     }
 }
 
+public enum QuicCloseCause {
+    | Transport(UInt64)
+    | Application(UInt64)
+    | IdleTimeout
+    | HandshakeTimeout
+    | StatelessReset
+}
+
+public class QuicConfig {
+    public let parameters: TransportParams
+    public let ecn: Bool
+    public let ackEvery: Int64
+    public let onDatagram: Option<(Array<UInt8>) -> Unit>
+    public let qlog: Option<(String) -> Unit>
+    public let ackRangeLimit: Int64
+    public let receiveBatch: Int64
+    public let keepaliveMs: Int64
+    public let sendMtu: Int64
+    public let log: Option<(String) -> Unit>
+
+    public init(parameters!: TransportParams = TransportParams(), ackRangeLimit!: Int64 = 512,
+        receiveBatch!: Int64 = 16, keepaliveMs!: Int64 = 0, sendMtu!: Int64 = 1200,
+        log!: Option<(String) -> Unit> = None, qlog!: Option<(String) -> Unit> = None,
+        ackEvery!: Int64 = 1, ecn!: Bool = true, onDatagram!: Option<(Array<UInt8>) -> Unit> = None) {
+        if (ackRangeLimit < 1 || ackRangeLimit > 8192 || receiveBatch < 1 || receiveBatch > 128 ||
+            keepaliveMs < 0 || sendMtu < 1200 || sendMtu > 65527) { throw Exception("invalid QUIC settings") }
+        if (ackEvery < 1 || ackEvery > 2) { throw Exception("ACK interval must be one or two packets") }
+        this.ecn = ecn
+        this.qlog = qlog
+        this.ackEvery = ackEvery
+        this.onDatagram = onDatagram
+        this.parameters = parameters
+        this.ackRangeLimit = ackRangeLimit
+        this.receiveBatch = receiveBatch
+        this.keepaliveMs = keepaliveMs
+        this.sendMtu = sendMtu
+        this.log = log
+    }
+}
+
 public class QuicConnection {
+    private var cause: Option<QuicCloseCause> = None
+    public prop closeCause: Option<QuicCloseCause> { get() { cause } }
+    private let config: QuicConfig
+    private let receiveBuffer = Array<UInt8>(65535, repeat: 0)
+    private var pathMtu = 1200
+    private var probeSize = 1200
+    private var mtuProbe: Option<RecoveryFrame> = None
+    private var nextMtuProbe: Int64 = 0
+    public prop validatedMtu: Int64 { get() { pathMtu } }
+    private let ecnReceived = Array<Array<UInt64>>(3, { _ => Array<UInt64>(3, repeat: 0) })
+    private var inputEcn = 0
+    private var ecnFailed = false
+    private var ecnValidated = false
+    private var ecnTrialSent = 0
+    private var ecnTrialStart = 0
+    private var markedSent: UInt64 = 0
+    private var peerEct0: UInt64 = 0
+    private var peerCe: UInt64 = 0
+    public prop ecnActive: Bool { get() { socket.supportsEcn && ecnValidated && !ecnFailed } }
+    public prop congestionExperienced: UInt64 { get() { peerCe } }
+    private var lastKeepalive = 0
+    private var pendingAck = 0
+    private var ackDeadline = Int64.Max
+    private var largestAppTime: Int64 = 0
+    private var txCount: Int64 = 0
+    public prop packetsSent: Int64 { get() { txCount } }
+    private let traceStart = nowMillis()
+
+    public prop smoothedRttMs: Int64 { get() { recovery.srtt } }
+    public prop congestionWindow: Int64 { get() { recovery.window } }
+    public prop bytesInFlight: Int64 { get() { recovery.bytesInFlight } }
+    public prop packetsLost: Int64 { get() { recovery.packetsLost } }
+    public prop streamCount: Int64 { get() { streams.size } }
+    public prop streamBytesSent: Int64 { get() { sentData } }
+    public prop streamBytesReceived: Int64 { get() { receivedData } }
+
     public let host: String
     public let port: UInt16
-    var socket: UdpSocket
+    var socket: QuicSocket
     let peer: IPSocketAddress
 
     var dcid: Array<UInt8>
@@ -119,12 +203,7 @@ public class QuicConnection {
     var largestRecvInitial: Int64 = -1
     var largestRecvHandshake: Int64 = -1
     var largestRecvApp: Int64 = -1
-    var recvInitial: Array<Int64>
-    var recvHandshake: Array<Int64>
-    var recvApp: Array<Int64>
-    var recvInitialCount: Int64 = 0
-    var recvHandshakeCount: Int64 = 0
-    var recvAppCount: Int64 = 0
+    private let received: Array<ReceivedPackets>
 
     let cryptoReceive = [ReceiveRanges(), ReceiveRanges(), ReceiveRanges()]
     var clientHello: Array<UInt8>
@@ -147,7 +226,7 @@ public class QuicConnection {
 
     public func session(): Option<QuicSession> {
         if (let Some(ticket) <- tls.newTicket) {
-            return Some(QuicSession(port, version, ticket, peerAppParams))
+            return Some(QuicSession(port, version, ticket.duplicate(), peerAppParams))
         }
         return None
     }
@@ -157,7 +236,10 @@ public class QuicConnection {
     private var receivedData: Int64 = 0
     private var sentData: Int64 = 0
     private let streams = HashMap<Int64, QuicStream>()
-    private let sendStreams = ArrayList<QuicStream>()
+    // Retain recent final sizes for delayed duplicates without pinning application buffers.
+    private let retiredIds = Array<Int64>(256, repeat: -1)
+    private let retiredSizes = Array<Int64>(256, repeat: 0)
+    private let sendStreams = LinkedList<QuicStream>()
     private let recovery = LossRecovery()
     private let nextPn = Array<Int64>(3, repeat: 0)
 
@@ -169,9 +251,9 @@ public class QuicConnection {
     public var rxCount: Int64 = 0
     public var peerAppParams: Array<UInt8> = Array<UInt8>(0, repeat: 0)
 
-    private init(host: String, port: UInt16, socket: UdpSocket, peer: IPSocketAddress,
+    private init(host: String, port: UInt16, socket: QuicSocket, peer: IPSocketAddress,
         dcid: Array<UInt8>, store: TrustStore, verifyPeer: Bool, backend: CryptoBackend,
-        session: Option<QuicSession>, allowEarlyData: Bool, version: UInt32) {
+        session: Option<QuicSession>, allowEarlyData: Bool, version: UInt32, tlsOptions: TlsOptions, config: QuicConfig) {
         this.host = host
         this.port = port
         this.socket = socket
@@ -182,7 +264,8 @@ public class QuicConnection {
         scid = randomBytes(8)
         localConnectionIds.add(0, scid)
         peerCid = Array<UInt8>(0, repeat: 0)
-        tp = TransportParams()
+        this.config = config
+        tp = TransportParams.decode(config.parameters.encode())
         tp.initialSourceConnectionId = scid
         tp.disableActiveMigration = true
         tp.chosenVersion = version
@@ -194,35 +277,42 @@ public class QuicConnection {
         handshakeServer = PacketKeys([], [], [])
         appClient = PacketKeys([], [], [])
         appServer = PacketKeys([], [], [])
-        recvInitial = Array<Int64>(64, repeat: -1)
-        recvHandshake = Array<Int64>(64, repeat: -1)
-        recvApp = Array<Int64>(64, repeat: -1)
+        received = Array<ReceivedPackets>(3, { _ => ReceivedPackets(config.ackRangeLimit) })
         clientHello = []
         let ticket: Option<TlsTicket> = if (let Some(value) <- session) {
             if (value.port == port && value.version == version) { Some(value.tlsTicket) } else { Option<TlsTicket>.None }
         } else {
             None
         }
+        if (let Some(write) <- config.qlog) {
+            write(String.fromUtf8([30]) + #"{"qlog_version":"0.3","qlog_format":"JSON-SEQ","trace":{"vantage_point":{"type":"client"}}}"# + "\n")
+        }
         tls = TlsClient(host, "h3", tp.encode(), store, verifyPeer, backend: backend, ticket: ticket,
-            allowEarlyData: allowEarlyData, labelPrefix: keyLabelPrefix(version))
+            allowEarlyData: allowEarlyData, options: tlsOptions, labelPrefix: keyLabelPrefix(version))
     }
 
     public static func dial(host: String, port: UInt16, store: TrustStore,
-        verifyPeer: Bool, backend!: CryptoBackend = PURE_CRYPTO, session!: Option<QuicSession> = None,
-        allowEarlyData!: Bool = false, version!: UInt32 = QUIC_V1): QuicConnection {
-        if (version != QUIC_V1 && version != QUIC_V2) {
-            throw Exception("unsupported QUIC version")
-        }
+        verifyPeer: Bool, backend!: CryptoBackend = NativeCryptoBackend(), session!: Option<QuicSession> = None,
+        allowEarlyData!: Bool = false, version!: UInt32 = QUIC_V1, tlsOptions!: TlsOptions = TlsOptions(),
+        config!: QuicConfig = QuicConfig()): QuicConnection {
+        let normalized = asciiHost(host)
+        let addresses = resolvePeers(normalized)
+        return dialAddress(normalized, addresses[0], port, store, verifyPeer, backend, session,
+            allowEarlyData, version, tlsOptions, config)
+    }
+
+    private static func dialAddress(host: String, ip: IPAddress, port: UInt16, store: TrustStore,
+        verifyPeer: Bool, backend: CryptoBackend, session: Option<QuicSession>, allowEarlyData: Bool,
+        version: UInt32, tlsOptions: TlsOptions, config: QuicConfig): QuicConnection {
+        if (version != QUIC_V1 && version != QUIC_V2) { throw Exception("unsupported QUIC version") }
         let dcid = randomBytes(8)
-        let ip = resolvePeer(host)
         let peer = IPSocketAddress(ip, port)
         let bindHost = if (ip is IPv6Address) { "::" } else { "0.0.0.0" }
-        let socket = UdpSocket(bindAt: IPSocketAddress(bindHost, 0))
+        let socket = QuicSocket(IPSocketAddress(bindHost, 0), peer, config)
         try {
-            socket.bind()
             socket.receiveTimeout = Some(Duration.millisecond * 10)
             let conn = QuicConnection(host, port, socket, peer, dcid, store, verifyPeer, backend,
-                session, allowEarlyData, version)
+                session, allowEarlyData, version, tlsOptions, config)
             let (c, s) = PacketCrypto.initialSecrets(dcid, backend: backend, version: version)
             conn.initialClient = c
             conn.initialServer = s
@@ -239,73 +329,63 @@ public class QuicConnection {
         }
     }
 
-    private static func resolvePeer(host: String): IPAddress {
-        try {
-            return IPAddress.parse(host)
-        } catch (e: Exception) {
+    private static func resolvePeers(host: String): Array<IPAddress> {
+        try { return [IPAddress.parse(host)] } catch (e: Exception) {
             let addresses = IPAddress.resolve(host)
-            if (addresses.size == 0) {
-                throw Exception("cannot resolve " + host)
-            }
-            for (address in addresses) {
-                if (address is IPv4Address) {
-                    return address
+            if (addresses.isEmpty()) { throw Exception("cannot resolve " + host) }
+            // Preserve the resolver's first choice and try the other family second.
+            for (i in 1..addresses.size) {
+                if ((addresses[i] is IPv6Address) != (addresses[0] is IPv6Address)) {
+                    let next = addresses[i]
+                    for (j in 1..i) { addresses[i - j + 1] = addresses[i - j] }
+                    addresses[1] = next
+                    break
                 }
             }
-            return addresses[0]
+            return addresses
+        }
+    }
+
+    /** Race complete, verified handshakes with staggered address attempts (RFC 8305). */
+    public static func connect(host: String, port: UInt16, store: TrustStore, verifyPeer: Bool,
+        timeoutMs!: Int64 = 8000, backend!: CryptoBackend = NativeCryptoBackend(),
+        tlsOptions!: TlsOptions = TlsOptions(), config!: QuicConfig = QuicConfig(),
+        connectHost!: String = ""): Option<QuicConnection> {
+        let origin = asciiHost(host)
+        let addresses = resolvePeers(if (connectHost == "") { origin } else { asciiHost(connectHost) })
+        let active = ArrayList<QuicConnection>()
+        let deadline = nowMillis() + timeoutMs
+        var index = 0
+        var nextStart = nowMillis()
+        try {
+            while (nowMillis() < deadline && (index < addresses.size || !active.isEmpty())) {
+                if (index < addresses.size && (active.isEmpty() || nowMillis() >= nextStart)) {
+                    let address = addresses[index]
+                    index++
+                    try {
+                        let attempt = dialAddress(origin, address, port, store, verifyPeer, backend, None,
+                            false, QUIC_V1, tlsOptions, config)
+                        active.add(attempt)
+                        attempt.sendClientHello()
+                    } catch (e: Exception) { continue }
+                    nextStart = nowMillis() + 250
+                }
+                var i = 0
+                while (i < active.size && nowMillis() < deadline) {
+                    let attempt = active[i]
+                    attempt.pollOnce()
+                    if (attempt.closed) { active.remove(at: i); continue }
+                    if (attempt.established) { return Some(active.remove(at: i)) }
+                    i++
+                }
+            }
+            return None
+        } finally {
+            for (attempt in active) { attempt.terminate("address attempt abandoned") }
         }
     }
 
     // ------------------------------------------------------------------
-
-    private func encodeAck(space: Int64): Array<UInt8> {
-        let w = ByteWriter(64)
-        let count = if (space == 0) { recvInitialCount } else if (space == 1) {
-            recvHandshakeCount
-        } else {
-            recvAppCount
-        }
-        if (count == 0) {
-            return w.toArray()
-        }
-        let arr = if (space == 0) { recvInitial } else if (space == 1) {
-            recvHandshake
-        } else {
-            recvApp
-        }
-        let largest = arr[count - 1]
-        let ranges = Array<Int64>(128, repeat: 0)
-        var rangeCount: Int64 = 0
-        var i = count - 1
-        while (i >= 0) {
-            let hi = arr[i]
-            var lo = hi
-            while (i > 0 && arr[i - 1] == lo - 1) {
-                lo = arr[i - 1]
-                i--
-            }
-            ranges[rangeCount * 2] = hi
-            ranges[rangeCount * 2 + 1] = lo
-            rangeCount++
-            i--
-        }
-        w.putU8(0x02)
-        Varint.write(w, UInt64(largest))
-        Varint.write(w, 0)
-        Varint.write(w, UInt64(rangeCount - 1))
-        // First ACK Range (RFC 9000 section 19.3), then the gap/range pairs.
-        Varint.write(w, UInt64(ranges[0] - ranges[1]))
-        var k: Int64 = 1
-        while (k < rangeCount) {
-            let prevLo = ranges[(k - 1) * 2 + 1]
-            let hi = ranges[k * 2]
-            let lo = ranges[k * 2 + 1]
-            Varint.write(w, UInt64(prevLo - hi - 2))
-            Varint.write(w, UInt64(hi - lo))
-            k++
-        }
-        return w.toArray()
-    }
 
     private func protectApplication(cid: Array<UInt8>, payload: Array<UInt8>): Array<UInt8> {
         let pn = nextPn[2]
@@ -332,6 +412,17 @@ public class QuicConnection {
     /** Number of times the current connection detected persistent congestion. */
     public prop persistentCongestionEvents: Int64 {
         get() { recovery.persistentCongestionEvents }
+    }
+
+    private func tracePacket(direction: String, space: Int64, pn: Int64): Unit {
+        if (let Some(write) <- config.qlog) {
+            let kind = if (space == 0) { "initial" } else if (space == 1) { "handshake" } else if (!established) {
+                "0RTT"
+            } else { "1RTT" }
+            let time = nowMillis() - traceStart
+            write(String.fromUtf8([30]) + "{\"time\":${time},\"name\":\"transport:packet_${direction}\"," +
+                "\"data\":{\"header\":{\"packet_type\":\"${kind}\",\"packet_number\":${pn}}}}\n")
+        }
     }
 
     private func sendPacket(space: Int64, payload: Array<UInt8>, frame: Option<RecoveryFrame>,
@@ -369,24 +460,42 @@ public class QuicConnection {
             let padding = if (space == 0) { 1200 } else { 0 }
             PacketBuilder.longHeader(space, dcid, scid, retryToken, pn, 4, keys, payload, padding)
         }
+        let ect = space == 2 && handshakeDone && frame.isSome() && socket.supportsEcn &&
+            !ecnFailed && (ecnValidated || ecnTrialSent < 10)
         try {
-            socket.sendTo(peer, packet)
+            socket.sendTo(peer, packet, ect: ect)
         } catch (e: Exception) {
+            if (space == 2 && packet.size > 1200) {
+                pathMtu = 1200
+                nextMtuProbe = nowMillis() + 60000
+                return false
+            }
             lastError = "send failed: ${e}"
             return false
         }
+        if (ect) {
+            markedSent++
+            if (!ecnValidated) {
+                if (ecnTrialSent == 0) { ecnTrialStart = nowMillis() }
+                ecnTrialSent++
+            }
+        }
+        txCount++
+        tracePacket("sent", space, pn)
         wireNumbers[space].sent(pn)
         let time = nowMicros()
         if (let Some(sent) <- frame) {
             if (recovery.bytesInFlight == 0) {
                 lastActivity = time / 1000
             }
-            recovery.sent(space, pn, time / 1000, packet.size, sent, timeMicros: time)
+            recovery.sent(space, pn, time / 1000, packet.size, sent, timeMicros: time, ect: ect)
         } else {
             recovery.sentNonEliciting(space, pn, time / 1000)
         }
         if (space == 1 && initialClient.key.size > 0) {
             recovery.discard(0)
+            initialClient.destroy()
+            initialServer.destroy()
             initialClient = PacketKeys([], [], [])
             initialServer = PacketKeys([], [], [])
         }
@@ -394,7 +503,7 @@ public class QuicConnection {
     }
 
     private func queueFrame(space: Int64, bytes: Array<UInt8>): Unit {
-        recovery.spaces[space].pending.add(RecoveryFrame(bytes))
+        recovery.spaces[space].pending.addLast(RecoveryFrame(bytes))
     }
 
     private func flushRecovery(): Unit {
@@ -404,31 +513,101 @@ public class QuicConnection {
             }
             let queue = recovery.spaces[space].pending
             while (queue.size > 0) {
-                let frame = queue[0]
+                let frame = queue.first.getOrThrow()
+                if (space == 2 && established && !frame.delivered && frame.bytes.size > pathMtu - 21 - dcid.size &&
+                    frame.bytes.size > 0 && (frame.bytes[0] & 0xf8) == 8) {
+                    // A migrated path or MTU black hole may require smaller retransmissions.
+                    queue.removeFirst()
+                    resegmentStream(frame.bytes)
+                    continue
+                }
                 if (!frame.delivered && !sendPacket(space, frame.bytes, Some(frame))) {
                     return
                 }
-                queue.remove(at: 0)
+                queue.removeFirst()
             }
+        }
+    }
+
+    private func resegmentStream(frame: Array<UInt8>): Unit {
+        let r = ByteReader(frame)
+        let kind = r.readU8()
+        let stream = Varint.read(r)
+        var offset = if ((kind & 4) != 0) { Varint.read(r) } else { 0u64 }
+        Varint.read(r)
+        while (!r.eof()) {
+            let size = if (r.remaining() < pathMtu - 96) { r.remaining() } else { pathMtu - 96 }
+            let w = ByteWriter()
+            w.putU8(if (size == r.remaining()) { 0x0e | (kind & 1) } else { 0x0e })
+            Varint.write(w, stream)
+            Varint.write(w, offset)
+            Varint.write(w, UInt64(size))
+            w.putBytes(r.readBytes(size))
+            queueFrame(2, w.toArray())
+            offset += UInt64(size)
+        }
+    }
+
+    private func updatePathMtu(now: Int64): Unit {
+        if (!handshakeDone || config.sendMtu <= 1200) { return }
+        if (recovery.largePacketLost) {
+            recovery.largePacketLost = false
+            pathMtu = 1200
+            mtuProbe = None
+            nextMtuProbe = now + 60000
+        }
+        if (let Some(frame) <- mtuProbe) {
+            if (frame.delivered) {
+                pathMtu = probeSize
+                mtuProbe = None
+            } else if (frame.inFlight == 0) {
+                mtuProbe = None
+                nextMtuProbe = now + 60000
+            }
+            return
+        }
+        let peerLimit = Int64(peerTp.maxUdpPayloadSize)
+        let ceiling = if (config.sendMtu < peerLimit) { config.sendMtu } else { peerLimit }
+        if (now < nextMtuProbe || pathMtu >= ceiling) { return }
+        probeSize = if (pathMtu + 128 < ceiling) { pathMtu + 128 } else { ceiling }
+        let bytes = Array<UInt8>(probeSize - 21 - dcid.size, repeat: 0)
+        bytes[0] = 1 // PING followed by PADDING, independent of application delivery.
+        let probe = RecoveryFrame(bytes, retransmittable: false, mtuProbe: true)
+        if (sendPacket(2, bytes, Some(probe))) {
+            mtuProbe = Some(probe)
+        } else {
+            if (nextMtuProbe <= now) { nextMtuProbe = now + recovery.pto(Int64(peerTp.maxAckDelay)) }
         }
     }
 
     private func tick(): Unit {
         let now = nowMillis()
+        if (!ecnValidated && ecnTrialSent > 0 && now - ecnTrialStart >= 3 * recovery.pto(Int64(peerTp.maxAckDelay))) {
+            ecnFailed = true
+        }
+        if (pendingAck > 0 && now >= ackDeadline) { sendAck(2) }
         if (now >= previousKeyExpires) {
+            if (let Some(keys) <- previousAppServer) { keys.destroy() }
             previousAppServer = None
         }
         let peerIdle = Int64(peerTp.maxIdleTimeout)
         let localIdle = Int64(tp.maxIdleTimeout)
-        let idle = if (peerIdle > 0 && peerIdle < localIdle) { peerIdle } else { localIdle }
-        if (now - lastActivity >= idle) {
+        let idle = if (peerIdle > 0 && (peerIdle < localIdle || localIdle == 0)) { peerIdle } else { localIdle }
+        if (idle > 0 && now - lastActivity >= idle && now - lastActivity >= 3 * recovery.pto(Int64(peerTp.maxAckDelay))) {
+            cause = Some(QuicCloseCause.IdleTimeout)
             terminate("idle timeout")
             return
+        }
+        if (established && config.keepaliveMs > 0 && now - lastActivity >= config.keepaliveMs &&
+            now - lastKeepalive >= config.keepaliveMs && recovery.bytesInFlight == 0) {
+            queueFrame(2, [1])
+            lastKeepalive = now
         }
         for (space in 0..3) {
             recovery.detectLoss(space, now)
         }
         nextPacedSend = Int64.Max
+        updatePathMtu(now)
         flushRecovery()
         flushStreamData()
         let probeSpace = recovery.probeSpace(now, handshakeDone, Int64(peerTp.maxAckDelay))
@@ -451,17 +630,25 @@ public class QuicConnection {
             }
         }
         let untilSend = nextPacedSend - nowMicros()
-        let timeout = if (untilSend <= 0) { 1 } else if (untilSend < 10000) { untilSend } else { 10000 }
+        let ackWait = if (pendingAck > 0) { (ackDeadline - nowMillis()) * 1000 } else { 10000 }
+        let wait = if (untilSend < ackWait) { untilSend } else { ackWait }
+        let timeout = if (wait <= 0) { 1 } else if (wait < 10000) { wait } else { 10000 }
         socket.receiveTimeout = Some(Duration.microsecond * timeout)
         let received = readSocket(socket, false)
+        if (received && !closed && config.receiveBatch > 1) {
+            socket.receiveTimeout = Some(Duration.microsecond)
+            for (_ in 1..config.receiveBatch) {
+                if (closed || !readSocket(socket, false)) { break }
+            }
+        }
         if (!closed) {
             tick()
         }
         return received
     }
 
-    private func readSocket(source: UdpSocket, probing: Bool): Bool {
-        let buf = Array<UInt8>(2048, repeat: 0)
+    private func readSocket(source: QuicSocket, probing: Bool): Bool {
+        let buf = receiveBuffer
         var received = false
         try {
             let (sender, n) = source.receiveFrom(buf)
@@ -469,7 +656,8 @@ public class QuicConnection {
                 received = true
                 rxCount++
                 fromProbe = probing
-                processDatagram(sliceBytes(buf, 0, n))
+                inputEcn = source.receivedEcn
+                processDatagram(buf[0..n])
             }
         } catch (e: Exception) {
             // Receive timeout also drives the recovery timers.
@@ -485,12 +673,18 @@ public class QuicConnection {
             return
         }
         lastActivity = nowMillis()
+        let immediate = space != 2 || fromProbe || pkt.pn != largestRecvApp + 1
         if (!recordRecv(space, pkt.pn)) {
             return
         }
+        if (space == 2 && pkt.pn == largestRecvApp) { largestAppTime = nowMicros() }
+        if (inputEcn == 2) { ecnReceived[space][0]++ }
+        if (inputEcn == 1) { ecnReceived[space][1]++ }
+        if (inputEcn == 3) { ecnReceived[space][2]++ }
+        tracePacket("received", space, pkt.pn)
         inputCid = pkt.dcid
         try {
-            handleFrames(space, pkt.payload)
+            handleFrames(space, pkt.payload, immediate || inputEcn == 3)
         } catch (e: Exception) {
             lastError = "protocol error: ${e}"
             closeWithError(0x0a, lastError)
@@ -637,7 +831,9 @@ public class QuicConnection {
     }
 
     private func rotateWriteKeys(): Unit {
+        let previous = appClient
         appClient = PacketCrypto.nextKeys(appClient, tls.hashAlg, tls.keyLen)
+        previous.destroy()
         writePhase = !writePhase
         writePhaseStart = nextPn[2]
         earliestWriteRotation = nowMillis() + 3 * recovery.pto(Int64(peerTp.maxAckDelay))
@@ -672,6 +868,7 @@ public class QuicConnection {
                 if (pkt.phase == readPhase || pkt.pn <= largestInReadPhase) {
                     return None
                 }
+                if (let Some(old) <- previousAppServer) { old.destroy() }
                 previousAppServer = Some(appServer)
                 previousKeyExpires = nowMillis() + 3 * recovery.pto(Int64(peerTp.maxAckDelay))
                 appServer = next
@@ -734,13 +931,17 @@ public class QuicConnection {
         recovery.newPath(nowMillis())
         wireNumbers = [SentNumbers(), SentNumbers(), SentNumbers()]
         nextPacedSend = Int64.Max
+        if (let Some(keys) <- earlyClient) { keys.destroy() }
         earlyClient = None
         initialCryptoSent = 0
         let (client, server) = PacketCrypto.initialSecrets(dcid, backend: tls.backend, version: version)
+        initialClient.destroy()
+        initialServer.destroy()
         initialClient = client
         initialServer = server
+        tls.destroy()
         tls = TlsClient(host, "h3", tp.encode(), tls.store, tls.verifyPeer, backend: tls.backend,
-            labelPrefix: keyLabelPrefix(version))
+            options: tls.options, labelPrefix: keyLabelPrefix(version))
         clientHello = tls.start()
         queueInitial(clientHello)
         flushRecovery()
@@ -750,13 +951,15 @@ public class QuicConnection {
         let tokenLen = packet.size - tokenOffset - 16
         if (!started || authenticatedInitial || retryToken.size > 0 || tokenLen <= 0 || tokenLen > 1100 ||
             sourceCid.size == 0 || ctEqual(sourceCid, originalDcid) ||
-            !PacketCrypto.verifyRetry(originalDcid, packet, version: version)) {
+            !PacketCrypto.verifyRetry(originalDcid, packet, version: version, backend: tls.backend)) {
             return
         }
         retryCid = sourceCid
         retryToken = sliceBytes(packet, tokenOffset, tokenLen)
         dcid = sourceCid
         let (client, server) = PacketCrypto.initialSecrets(dcid, backend: tls.backend, version: version)
+        initialClient.destroy()
+        initialServer.destroy()
         initialClient = client
         initialServer = server
         recovery.discard(0)
@@ -766,82 +969,38 @@ public class QuicConnection {
     }
 
     private func printDecryptFailure(space: Int64, pkt: Array<UInt8>): Unit {
-        if (debug) {
+        if (let Some(log) <- config.log) {
             let n = if (pkt.size < 40) {
                 pkt.size
             } else {
                 40
             }
-            println("DBG decrypt-fail space=${space} len=${pkt.size} hdr=" + hexEncode(sliceBytes(pkt, 0, n)))
+            log("decrypt-fail space=${space} len=${pkt.size} hdr=" + hexEncode(sliceBytes(pkt, 0, n)))
         }
     }
 
     private func recordRecv(space: Int64, pn: Int64): Bool {
-        let numbers = if (space == 0) { recvInitial } else if (space == 1) {
-            recvHandshake
-        } else {
-            recvApp
-        }
-        var count = if (space == 0) { recvInitialCount } else if (space == 1) {
-            recvHandshakeCount
-        } else {
-            recvAppCount
-        }
-        if (count == numbers.size && pn < numbers[0]) {
-            return false
-        }
-        var index = count
-        while (index > 0 && numbers[index - 1] > pn) {
-            index--
-        }
-        if (index > 0 && numbers[index - 1] == pn) {
-            return false
-        }
-        if (count == numbers.size) {
-            for (i in 1..count) {
-                numbers[i - 1] = numbers[i]
-            }
-            count--
-            index--
-        }
-        var i = count
-        while (i > index) {
-            numbers[i] = numbers[i - 1]
-            i--
-        }
-        numbers[index] = pn
-        count++
-        if (space == 0) {
-            largestRecvInitial = numbers[count - 1]
-            recvInitialCount = count
-        } else if (space == 1) {
-            largestRecvHandshake = numbers[count - 1]
-            recvHandshakeCount = count
-        } else {
-            largestRecvApp = numbers[count - 1]
-            recvAppCount = count
-        }
+        if (!received[space].record(pn)) { return false }
+        if (space == 0 && pn > largestRecvInitial) { largestRecvInitial = pn }
+        if (space == 1 && pn > largestRecvHandshake) { largestRecvHandshake = pn }
+        if (space == 2 && pn > largestRecvApp) { largestRecvApp = pn }
         return true
     }
 
     // ------------------------------------------------------------------
 
-    private func handleFrames(space: Int64, payload: Array<UInt8>): Unit {
+    private func handleFrames(space: Int64, payload: Array<UInt8>, immediate: Bool): Unit {
         let r = ByteReader(payload)
         var needAck = false
         while (!r.eof()) {
+            let frameStart = r.pos
             let ftype = Varint.read(r)
             if (ftype == 0) {
                 continue
             } else if (ftype == 1) {
                 needAck = true
             } else if (ftype == 2 || ftype == 3) {
-                handleAck(r, space)
-                if (ftype == 3) {
-                    for (_ in 0..3) {
-                        Varint.read(r)
-                    }
-                }
+                handleAck(r, space, ftype == 3)
             } else if (ftype == 6) {
                 needAck = true
                 let off = Int64(Varint.read(r))
@@ -852,9 +1011,11 @@ public class QuicConnection {
                 throw Exception("frame forbidden at this encryption level")
             } else if (ftype == 4) {
                 needAck = true
-                let st = receiveStream(Int64(Varint.read(r)))
+                let id = Int64(Varint.read(r))
                 let code = Varint.read(r)
                 let finalSize = Int64(Varint.read(r))
+                if (wasReleased(id, finalSize, true)) { continue }
+                let st = receiveStream(id)
                 accountReceived(st, finalSize, true)
                 st.receiveReset = Some(code)
             } else if (ftype == 5) {
@@ -868,7 +1029,7 @@ public class QuicConnection {
                     resetSend(st, code)
                 } else if ((id & 1) == 1) {
                     resetSend(receiveStream(id), code)
-                } else {
+                } else if (!wasReleased(id, 0, false)) {
                     throw Exception("STOP_SENDING on unopened local stream")
                 }
             } else if (ftype == 7) {
@@ -950,13 +1111,27 @@ public class QuicConnection {
                     Varint.read(r)
                 }
                 let message = r.readBytes(Int64(Varint.read(r)))
+                cause = Some(if (ftype == 0x1c) { QuicCloseCause.Transport(code) } else { QuicCloseCause.Application(code) })
+                retainClosingPath(None)
                 terminate("peer closed (code ${code}): " + String.fromUtf8(message))
                 return
+            } else if (ftype == 0x30 || ftype == 0x31) {
+                let size = if (ftype == 0x31) { Int64(Varint.read(r)) } else { r.remaining() }
+                if (UInt64(r.pos - frameStart + size) > tp.initialMaxDatagramFrameSize) {
+                    throw Exception("DATAGRAM exceeds local transport parameter")
+                }
+                let payload = r.readBytes(size)
+                if (let Some(deliver) <- config.onDatagram) { deliver(payload) }
+                needAck = true
             } else if (ftype == 0x1e) {
                 needAck = true
                 if (!handshakeDone) {
                     handshakeDone = true
                     recovery.discard(1)
+                    tls.clientHs.destroy()
+                    tls.serverHs.destroy()
+                    handshakeClient.destroy()
+                    handshakeServer.destroy()
                     handshakeClient = PacketKeys([], [], [])
                     handshakeServer = PacketKeys([], [], [])
                     ensureLocalCids()
@@ -969,11 +1144,15 @@ public class QuicConnection {
             }
         }
         if (needAck) {
-            sendAck(space)
+            if (space == 2) {
+                pendingAck++
+                if (pendingAck == 1) { ackDeadline = nowMillis() + Int64(tp.maxAckDelay) }
+            }
+            if (immediate || pendingAck >= config.ackEvery || tp.maxAckDelay == 0) { sendAck(space) }
         }
     }
 
-    private func handleAck(r: ByteReader, space: Int64): Unit {
+    private func handleAck(r: ByteReader, space: Int64, hasEcn: Bool): Unit {
         let (ranges, encodedDelay) = wireNumbers[space].decodeAck(r)
         let maxDelay = Int64(peerTp.maxAckDelay)
         let exponent = peerTp.ackDelayExponent
@@ -985,7 +1164,24 @@ public class QuicConnection {
         } else {
             (encodedDelay << exponent) / 1000
         }
-        recovery.ack(space, ranges, delay, nowMillis(), maxAckDelay: maxDelay)
+        let forward = ranges[0].high > recovery.spaces[space].largestAcked
+        let ect0 = if (hasEcn) { Varint.read(r) } else { 0u64 }
+        let ect1 = if (hasEcn) { Varint.read(r) } else { 0u64 }
+        let ce = if (hasEcn) { Varint.read(r) } else { 0u64 }
+        let now = nowMillis()
+        recovery.ack(space, ranges, delay, now, maxAckDelay: maxDelay)
+        if (space != 2 || !forward || markedSent == 0 || ecnFailed) { return }
+        let acked = UInt64(recovery.newlyAckedEct)
+        if (!hasEcn && acked == 0) { return }
+        if (!hasEcn || ect1 != 0 || ect0 < peerEct0 || ce < peerCe || ect0 + ce > markedSent ||
+            ect0 - peerEct0 + ce - peerCe < acked) {
+            ecnFailed = true
+            return
+        }
+        if (acked > 0) { ecnValidated = true }
+        if (ce > peerCe) { recovery.ecnCongestion(now) }
+        peerCe = ce
+        peerEct0 = ect0
     }
 
     private func onCrypto(space: Int64, off: Int64, data: Array<UInt8>): Unit {
@@ -1009,6 +1205,7 @@ public class QuicConnection {
         }
         let out = tls.takeOutput()
         if (out.size > 0 && !tls.handshakeComplete) {
+            if (let Some(keys) <- earlyClient) { keys.destroy() }
             earlyClient = None
             queueInitial(out)
         }
@@ -1033,7 +1230,13 @@ public class QuicConnection {
             appClient = trafficKeys(tls.clientApp, tls.cipherSuite)
             appServer = trafficKeys(tls.serverApp, tls.cipherSuite)
             nextAppServer = Some(PacketCrypto.nextKeys(appServer, tls.hashAlg, tls.keyLen))
-            queueFrame(1, cryptoFrame(0, out))
+            var offset = 0
+            while (offset < out.size) {
+                let remaining = out.size - offset
+                let length = if (remaining > 1100) { 1100 } else { remaining }
+                queueFrame(1, cryptoFrame(offset, sliceBytes(out, offset, length)))
+                offset += length
+            }
             established = true
         }
     }
@@ -1060,11 +1263,13 @@ public class QuicConnection {
     }
 
     private func trafficKeys(direction: TlsDirection, suite: Int64): PacketKeys {
-        return PacketKeys(direction.key, direction.iv, direction.hp, secret: direction.secret,
+        return PacketKeys(direction.key.clone(), direction.iv.clone(), direction.hp.clone(),
+            secret: direction.secret.clone(),
             chacha: suite == 0x1303, backend: tls.backend, version: version)
     }
 
     private func reconcileEarlyData(remembered: TransportParams): Unit {
+        if (let Some(keys) <- earlyClient) { keys.destroy() }
         earlyClient = None
         if (tls.earlyAccepted &&
             (peerTp.initialMaxData < remembered.initialMaxData ||
@@ -1091,7 +1296,8 @@ public class QuicConnection {
                 stream.sendOff = 0
                 stream.finSent = false
             }
-            sendStreams.add(stream)
+            stream.scheduled = true
+            sendStreams.addLast(stream)
         }
         earlyStreams.clear()
     }
@@ -1217,13 +1423,14 @@ public class QuicConnection {
         let token = sliceBytes(packet, packet.size - 16, 16)
         for ((_, candidate) in peerConnectionIds) {
             if (ctEqual(token, candidate.resetToken)) {
-                terminate("peer sent a stateless reset")
+                cause = Some(QuicCloseCause.StatelessReset)
+            terminate("peer sent a stateless reset")
                 return
             }
         }
     }
 
-    private func sendPathFrame(source: UdpSocket, cid: Array<UInt8>, kind: UInt8,
+    private func sendPathFrame(source: QuicSocket, cid: Array<UInt8>, kind: UInt8,
         challenge: Array<UInt8>, activePath!: Bool = false): Unit {
         let payload = Array<UInt8>(1200 - 1 - cid.size - 4 - 16, repeat: 0)
         payload[0] = kind
@@ -1256,8 +1463,7 @@ public class QuicConnection {
             if (next.isNone()) { pollOnce() }
         }
         if (let Some((sequence, cid)) <- next) {
-            let candidate = UdpSocket(bindAt: bindAt)
-            candidate.bind()
+            let candidate = QuicSocket(bindAt, peer, config)
             candidate.receiveTimeout = Some(Duration.millisecond * 10)
             let probe = PathProbe(candidate, sequence, cid.id)
             pathProbe = Some(probe)
@@ -1281,6 +1487,12 @@ public class QuicConnection {
                     let previous = destinationSequence
                     destinationSequence = probe.sequence
                     dcid = probe.connectionId
+                    ecnFailed = false
+                    ecnValidated = false
+                    ecnTrialSent = 0
+                    pathMtu = 1200
+                    mtuProbe = None
+                    nextMtuProbe = 0
                     recovery.newPath(nowMillis())
                     nextPacedSend = Int64.Max
                     retirePeerCid(previous)
@@ -1343,6 +1555,7 @@ public class QuicConnection {
     }
 
     private func onStreamFrame(id: Int64, off: Int64, data: Array<UInt8>, fin: Bool): Unit {
+        if (wasReleased(id, off + data.size, fin)) { return }
         let stream = receiveStream(id)
         accountReceived(stream, off + data.size, fin)
         if (stream.receiveReset.isNone()) {
@@ -1364,7 +1577,11 @@ public class QuicConnection {
     }
 
     private func sendAck(space: Int64): Unit {
-        let ack = encodeAck(space)
+        let delay: UInt64 = if (space == 2) { UInt64(nowMicros() - largestAppTime) >> tp.ackDelayExponent } else { 0 }
+        let counts = ecnReceived[space]
+        let feedback: Option<Array<UInt64>> = if (counts[0] + counts[1] + counts[2] > 0) { Some(counts) } else { None }
+        let ack = received[space].encode(delay: delay, ecn: feedback)
+        if (space == 2) { pendingAck = 0; ackDeadline = Int64.Max }
         if (space == 2 && fromProbe) {
             let probe = pathProbe.getOrThrow()
             let pn = nextPn[2]
@@ -1375,7 +1592,6 @@ public class QuicConnection {
         }
     }
 
-    public var debug: Bool = false
 
     public func sendClientHello(): Unit {
         if (!started && !closed) {
@@ -1393,6 +1609,7 @@ public class QuicConnection {
             pollOnce()
         }
         if (!established && !closed) {
+            cause = Some(QuicCloseCause.HandshakeTimeout)
             lastError = "handshake timeout (tls state ${tls.state})"
             terminate(lastError)
         }
@@ -1420,7 +1637,7 @@ public class QuicConnection {
         let index = st.id >> 2
         match (st.id & 3) {
             case 0 =>
-                if (UInt64(index) >= peerTp.initialMaxStreamsBidi) {
+                if (index != localBidiCount || UInt64(index) >= peerTp.initialMaxStreamsBidi) {
                     throw Exception("peer bidirectional stream limit reached")
                 }
                 localBidiCount = index + 1
@@ -1440,6 +1657,26 @@ public class QuicConnection {
                 st.maxReceive = Int64(tp.initialMaxStreamDataUni)
         }
         streams.add(st.id, st)
+    }
+
+    /** Release an application-consumed local bidirectional stream. Recovery owns its queued frames. */
+    public func releaseStream(id: Int64): Unit {
+        if (let Some(stream) <- streams.get(id)) {
+            if ((id & 3) != 0 || !stream.recvFin || !stream.finSent) { return }
+            let slot = (id >> 2) % retiredIds.size
+            retiredIds[slot] = id
+            retiredSizes[slot] = stream.recvFinOffset
+            streams.remove(id)
+        }
+    }
+
+    private func wasReleased(id: Int64, end: Int64, fin: Bool): Bool {
+        if ((id & 3) != 0 || (id >> 2) >= localBidiCount || streams.contains(id)) { return false }
+        let slot = (id >> 2) % retiredIds.size
+        if (retiredIds[slot] == id && (end > retiredSizes[slot] || (fin && end != retiredSizes[slot]))) {
+            throw Exception("inconsistent closed stream final size")
+        }
+        return true
     }
 
     public func getStream(id: Int64): Option<QuicStream> {
@@ -1462,7 +1699,8 @@ public class QuicConnection {
             throw Exception("invalid consumed stream offset")
         }
         let delta = consumed - st.creditedReceive
-        if (delta <= 0 || (delta < 65536 && !st.recvFin) || closed) {
+        if (delta <= 0 || (delta < 65536 && !st.recvFin && st.maxReceive - consumed > delta &&
+            Int64(tp.initialMaxData) - receivedData > delta) || closed) {
             return
         }
         st.creditedReceive = consumed
@@ -1488,7 +1726,8 @@ public class QuicConnection {
             throw Exception("0-RTT keys are unavailable")
         }
         sendClientHello()
-        if (st.sendBuf.size == 0 && !st.finQueued) {
+        if (!st.earlyRegistered) {
+            st.earlyRegistered = true
             earlyStreams.add(st)
         }
         enqueueStream(st, data, fin)
@@ -1506,10 +1745,11 @@ public class QuicConnection {
             !streams.contains(st.id)) {
             throw Exception("stream is not writable")
         }
-        if (st.sendOff == st.sendBuf.size) {
-            sendStreams.add(st)
+        if (!st.scheduled) {
+            st.scheduled = true
+            sendStreams.addLast(st)
         }
-        st.sendBuf = concat(st.sendBuf, data)
+        st.outgoing.putBytes(data)
         if (fin) {
             st.finQueued = true
         }
@@ -1528,39 +1768,35 @@ public class QuicConnection {
         if ((!established && !canSendEarlyData) || closed) {
             return
         }
-        var idx = 0
-        while (idx < sendStreams.size) {
-            let st = sendStreams[idx]
-            if (st.sendReset.isSome()) {
-                sendStreams.remove(at: idx)
+        var blocked = 0
+        while (blocked < sendStreams.size) {
+            let st = sendStreams.first.getOrThrow()
+            if (st.sendReset.isSome() || (st.sendOff == st.outgoing.size && (!st.finQueued || st.finSent))) {
+                sendStreams.removeFirst()
+                st.scheduled = false
                 continue
             }
             let streamLimit = if ((st.id & 2) == 0) { peerTp.initialMaxStreamsBidi } else {
                 peerTp.initialMaxStreamsUni
             }
-            if ((st.id & 1) == 0 && UInt64(st.id >> 2) >= streamLimit) {
-                idx++
-                continue
-            }
-            if (st.sendOff == st.sendBuf.size && (!st.finQueued || st.finSent)) {
-                sendStreams.remove(at: idx)
-                continue
-            }
-            let avail = st.sendBuf.size - st.sendOff
+            let avail = st.outgoing.size - st.sendOff
             let room = st.maxSend - st.sendOff
             let credit = Int64(peerTp.initialMaxData) - sentData
             var n = if (avail < room) { avail } else { room }
             if (n > credit) {
                 n = credit
             }
-            if (n > 1000) {
-                n = 1000
+            let payloadLimit = pathMtu - 96
+            if (n > payloadLimit) {
+                n = payloadLimit
             }
-            if (n < 0 || (n == 0 && avail > 0)) {
-                idx++
+            if (((st.id & 1) == 0 && UInt64(st.id >> 2) >= streamLimit) || n < 0 || (n == 0 && avail > 0)) {
+                sendStreams.removeFirst()
+                sendStreams.addLast(st)
+                blocked++
                 continue
             }
-            let fin = st.finQueued && st.sendOff + n == st.sendBuf.size
+            let fin = st.finQueued && st.sendOff + n == st.outgoing.size
             let w = ByteWriter(n + 32)
             var ftype: UInt8 = if (fin) { 0x0b } else { 0x0a }
             if (st.sendOff > 0) {
@@ -1580,7 +1816,19 @@ public class QuicConnection {
             st.sendOff += n
             sentData += n
             st.finSent = fin
+            sendStreams.removeFirst()
+            if (st.sendOff < st.outgoing.size) { sendStreams.addLast(st) } else { st.scheduled = false }
+            blocked = 0
         }
+    }
+
+    /** Send an unreliable RFC 9221 DATAGRAM when the peer and congestion budget allow it. */
+    public func sendDatagram(data: Array<UInt8>): Bool {
+        if (closed || !established || UInt64(data.size) + 1 > peerTp.initialMaxDatagramFrameSize ||
+            UInt64(data.size + dcid.size + 22) > peerTp.maxUdpPayloadSize ||
+            data.size + dcid.size + 22 > pathMtu) { return false }
+        let bytes = concat([0x30], data)
+        return sendPacket(2, bytes, Some(RecoveryFrame(bytes, retransmittable: false)))
     }
 
     public func closeConnection(reason: String): Unit {
@@ -1599,7 +1847,7 @@ public class QuicConnection {
         let w = ByteWriter(128)
         let app = application && space == 2
         w.putU8(if (app) { 0x1d } else { 0x1c })
-        Varint.write(w, code)
+        Varint.write(w, if (application && !app) { 0x0c } else { code })
         if (!app) {
             Varint.write(w, 0)
         }
@@ -1607,18 +1855,58 @@ public class QuicConnection {
         let size = if (msg.size < 1000) { msg.size } else { 1000 }
         Varint.write(w, UInt64(size))
         w.putBytes(msg, 0, size)
+        cause = Some(if (app) { QuicCloseCause.Application(code) } else { QuicCloseCause.Transport(code) })
         try {
             if (started) {
-                sendPacket(space, w.toArray(), None)
+                let frame = w.toArray()
+                let packet = if (space == 2) {
+                    protectApplication(dcid, frame)
+                } else {
+                    let keys = if (space == 1) { handshakeClient } else { initialClient }
+                    PacketBuilder.longHeader(space, dcid, scid, retryToken, nextPn[space], 4, keys,
+                        frame, if (space == 0) { 1200 } else { 0 })
+                }
+                socket.sendTo(peer, packet)
+                retainClosingPath(Some(packet))
             }
+        } catch (e: Exception) {
+            lastError = "close send failed: " + e.message
         } finally {
             terminate(reason)
+        }
+    }
+
+    // The endpoint owns the socket until three PTOs elapse. Reuse the identical protected
+    // close packet, at most once per PTO, and send nothing while draining a peer close.
+    private func retainClosingPath(packet: Option<Array<UInt8>>): Unit {
+        closed = true
+        let pto = recovery.pto(Int64(peerTp.maxAckDelay))
+        let deadline = nowMillis() + 3 * pto
+        var next = nowMillis()
+        while (true) {
+            let remaining = deadline - nowMillis()
+            if (remaining <= 0) { break }
+            socket.receiveTimeout = Some(Duration.millisecond * remaining)
+            try {
+                let (source, n) = socket.receiveFrom(receiveBuffer)
+                if (source == peer && n >= 21 && nowMillis() >= next) {
+                    if (let Some(response) <- packet) { socket.sendTo(peer, response) }
+                    next = nowMillis() + pto
+                }
+            } catch (e: Exception) { break }
         }
     }
 
     private func terminate(reason: String): Unit {
         closed = true
         closeReason = reason
+        tls.destroy()
+        for (keys in [initialClient, initialServer, handshakeClient, handshakeServer, appClient, appServer]) {
+            keys.destroy()
+        }
+        for (keys in [previousAppServer, nextAppServer, earlyClient]) {
+            if (let Some(value) <- keys) { value.destroy() }
+        }
         socket.close()
     }
 }

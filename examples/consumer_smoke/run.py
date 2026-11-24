@@ -88,7 +88,7 @@ def certificate(directory, cert, key):
     run([
         "openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
         "-nodes", "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=localhost",
-        "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        "-addext", "basicConstraints=critical,CA:FALSE", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
     ], cwd=directory)
 
 
@@ -127,6 +127,6 @@ async def smoke(header, direct_only):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-header", type=Path, help="use a local Cangjie 1.2.1 Cangjie.h")
-    parser.add_argument("--direct-only", action="store_true", help="test only the pure-Cangjie consumer")
+    parser.add_argument("--direct-only", action="store_true", help="test only the direct Cangjie consumer")
     args = parser.parse_args()
     asyncio.run(smoke(args.runtime_header, args.direct_only))

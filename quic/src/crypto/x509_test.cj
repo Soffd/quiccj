@@ -7,6 +7,17 @@ import std.fs.*
 @Test
 class X509Test {
     @TestCase
+    func ed25519Rfc8032Vector() {
+        let key = hexDecode("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+        let sig = hexDecode("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155" +
+            "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
+        @Expect(verifyEd25519(key, [], sig), true)
+        @Expect(verifyEd25519(key, [1], sig), false)
+        sig[63] |= 128
+        @Expect(verifyEd25519(key, [], sig), false)
+    }
+
+    @TestCase
     func strictDerObjectIds() {
         @Expect(Der.parse(hexDecode("0603883703")).readOid(), "2.999.3")
         @Expect(oidRejected(hexDecode("06022a80")), true)
@@ -65,6 +76,48 @@ class X509Test {
         @Expect(leaf.matchesHost("a.cloudflare-quic.com"), true)
         @Expect(leaf.matchesHost("evil.example"), false)
         @Expect(leaf.keyType, "EC")
+    }
+
+    @TestCase
+    func negativePathAndLeafPolicies() {
+        let chain = pemCertificates(String.fromUtf8(File.readFrom("testdata/chain.pem")))
+        let leaf = X509Cert.parse(chain[0])
+        let intermediate = X509Cert.parse(chain[1])
+        let root = TrustStore()
+        root.addDer(chain[2])
+        let at = leaf.notBefore + 1
+        for (backend in [PURE_CRYPTO, NativeCryptoBackend()]) {
+            @Expect(backend.verifyChain([leaf, intermediate], 2, root, "cloudflare-quic.com", at), true)
+            @Expect(backend.verifyChain([leaf], 1, root, "cloudflare-quic.com", at), false)
+            @Expect(backend.verifyChain([leaf, intermediate], 2, root, "cloudflare-quic.com", leaf.notAfter + 1), false)
+            @Expect(backend.verifyChain([leaf, intermediate], 2, root, "cloudflare-quic.com", leaf.notBefore - 1), false)
+            @Expect(backend.verifyChain([leaf, intermediate], 2, root, "a.b.cloudflare-quic.com", at), false)
+            @Expect(backend.verifyChain([leaf, intermediate], 2, root, "wrong.example", at), false)
+        }
+        @Expect(leaf.matchesHost("a..cloudflare-quic.com"), false)
+        @Expect(intermediate.permitsServer(at), false)
+        root.requireCrl = true
+        for (backend in [PURE_CRYPTO, NativeCryptoBackend()]) {
+            @Expect(backend.verifyChain([leaf, intermediate], 2, root, "cloudflare-quic.com", at), false)
+        }
+    }
+
+    @TestCase
+    func malformedAnchorCannotPartiallyUpdateStore() {
+        let store = TrustStore()
+        let pem = String.fromUtf8(File.readFrom("testdata/roots.pem"))
+        for (suffix in ["-----BEGIN CERTIFICATE-----", "-----BEGIN CERTIFICATE-----!-----END CERTIFICATE-----",
+            "-----BEGIN CERTIFICATE-----AA==-----END CERTIFICATE-----"]) {
+            var rejected = false
+            try { store.addPem(pem + suffix) } catch (e: Exception) { rejected = true }
+            @Expect(rejected, true)
+            @Expect(store.count, 0)
+        }
+    }
+
+    @TestCase
+    func idnaHostUsesWireName() {
+        @Expect(asciiHost("中文.example"), "xn--fiq228c.example")
     }
 
     @TestCase

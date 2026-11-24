@@ -1,5 +1,8 @@
 # cjpm / Cangjie build output
 target/
+cov_output/
+*.gcda
+*.gcno
 *.cjo
 *.bc
 *.a

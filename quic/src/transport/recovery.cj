@@ -83,9 +83,11 @@ class RecoveryFrame {
     let bytes: Array<UInt8>
     var delivered = false
     var inFlight = 0
+    let mtuProbe: Bool
     let retransmittable: Bool
 
-    init(bytes: Array<UInt8>, retransmittable!: Bool = true) {
+    init(bytes: Array<UInt8>, retransmittable!: Bool = true, mtuProbe!: Bool = false) {
+        this.mtuProbe = mtuProbe
         this.bytes = bytes
         this.retransmittable = retransmittable
     }
@@ -96,6 +98,7 @@ class SentPacket {
     let time: Int64
     let size: Int64
     let frame: RecoveryFrame
+    var ect = false
     let history: CongestionPacket
 
     init(pn: Int64, time: Int64, size: Int64, frame: RecoveryFrame, history: CongestionPacket) {
@@ -109,7 +112,7 @@ class SentPacket {
 
 class RecoverySpace {
     let sent = ArrayList<SentPacket>()
-    var pending = ArrayList<RecoveryFrame>()
+    let pending = LinkedList<RecoveryFrame>()
     var largestAcked = -1
     var lastSent = -1
 }
@@ -126,7 +129,9 @@ class LossRecovery {
     private var recoveryStart = -1
     private var latestRtt = 0
     private var minRtt = Int64.Max
-    private var srtt = 333
+    var srtt = 333
+    var packetsLost: Int64 = 0
+    var largePacketLost = false
     private var variance = 166
     private var ptoCount = 0
     private var avoidanceCredit = 0
@@ -138,7 +143,7 @@ class LossRecovery {
                 bytesInFlight -= packet.size
                 packet.frame.inFlight--
                 if (packet.frame.retransmittable && !packet.frame.delivered && packet.frame.inFlight == 0) {
-                    state.pending.add(packet.frame)
+                    state.pending.addLast(packet.frame)
                 }
             }
             state.sent.clear()
@@ -162,13 +167,15 @@ class LossRecovery {
     }
 
     func sent(space: Int64, pn: Int64, time: Int64, size: Int64, frame: RecoveryFrame,
-        timeMicros!: Int64 = -1): Unit {
+        timeMicros!: Int64 = -1, ect!: Bool = false): Unit {
         let entry = CongestionPacket(space, pn, time, true, minRtt != Int64.Max)
         history.sent(entry)
         if (timeMicros >= 0) {
             pacer.sent(timeMicros, size, window, srtt)
         }
-        spaces[space].sent.add(SentPacket(pn, time, size, frame, entry))
+        let packet = SentPacket(pn, time, size, frame, entry)
+        packet.ect = ect
+        spaces[space].sent.add(packet)
         spaces[space].lastSent = time
         frame.inFlight++
         bytesInFlight += size
@@ -191,8 +198,22 @@ class LossRecovery {
         ptoCount = 0
     }
 
+    var newlyAckedEct: Int64 = 0
+    var lastEctSentTime: Int64 = -1
+
+    func ecnCongestion(now: Int64): Unit {
+        if (lastEctSentTime > recoveryStart) {
+            window = if (window / 2 < MIN_WINDOW) { MIN_WINDOW } else { window / 2 }
+            threshold = window
+            recoveryStart = now
+            avoidanceCredit = 0
+        }
+    }
+
     func ack(space: Int64, ranges: ArrayList<AckRange>, delay: Int64, now: Int64,
         maxAckDelay!: Int64 = 0): Unit {
+        newlyAckedEct = 0
+        lastEctSentTime = -1
         history.ack(space, ranges)
         let state = spaces[space]
         let largest = ranges[0].high
@@ -216,6 +237,10 @@ class LossRecovery {
                 }
             }
             if (acknowledged) {
+                if (p.ect) {
+                    newlyAckedEct++
+                    if (p.time > lastEctSentTime) { lastEctSentTime = p.time }
+                }
                 state.sent.remove(at: i)
                 bytesInFlight -= p.size
                 p.frame.inFlight--
@@ -276,11 +301,19 @@ class LossRecovery {
                 (p.pn + 3 <= state.largestAcked || now - p.time >= lossDelay)) {
                 state.sent.remove(at: i)
                 p.history.lost = true
+                packetsLost++
+                if (p.frame.mtuProbe) {
+                    p.history.discarded = true
+                    bytesInFlight -= p.size
+                    p.frame.inFlight--
+                    continue
+                }
+                if (p.size > 1200) { largePacketLost = true }
                 lossSinceAck = true
                 bytesInFlight -= p.size
                 p.frame.inFlight--
                 if (p.frame.retransmittable && !p.frame.delivered && p.frame.inFlight == 0) {
-                    state.pending.add(p.frame)
+                    state.pending.addLast(p.frame)
                 }
                 if (p.time > recoveryStart) {
                     window = if (window / 2 < MIN_WINDOW) { MIN_WINDOW } else { window / 2 }

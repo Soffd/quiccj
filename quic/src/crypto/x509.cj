@@ -1,7 +1,7 @@
 package quic.crypto
 
 import std.env.getVariable
-import std.fs.File
+import std.fs.*
 import std.net.IPAddress
 import std.net.IPSocketAddress
 import std.collection.ArrayList
@@ -43,6 +43,7 @@ public class X509Cert {
     public var publicKeyDer: Array<UInt8> = []
     public var spki: Array<UInt8> = Array<UInt8>(0, repeat: 0)
     public var sigAlg: String = ""
+    var algorithmParameters: Array<UInt8> = []
     public var signature: Array<UInt8> = Array<UInt8>(0, repeat: 0)
     public var sans: Array<String> = Array<String>(8, repeat: "")
     public var sanCount: Int64 = 0
@@ -54,16 +55,26 @@ public class X509Cert {
     public var basicConstraintsPresent: Bool = false
     private var pathLen: Int64 = Int64.Max
     private var unknownCritical = false
+    var crlSign = false
     private var keyCertSign = false
     private let ipSans = ArrayList<Array<UInt8>>()
 
+    private func strongKey(): Bool {
+        if (keyType != "RSA") { return true }
+        try {
+            let key = Der.parse(spki).enter(0x30)
+            let modulus = key.readIntegerBytes()
+            return modulus.size > 256 || (modulus.size == 256 && (modulus[0] & 128) != 0)
+        } catch (e: Exception) { return false }
+    }
+
     func permitsIssuer(depth: Int64, now: Int64): Bool {
-        return isCA && depth <= pathLen && validAt(now) && !unknownCritical &&
+        return strongKey() && isCA && depth <= pathLen && validAt(now) && !unknownCritical &&
             (!keyUsagePresent || keyCertSign) && (!ekuPresent || ekuServerAuth)
     }
 
     func permitsServer(now: Int64): Bool {
-        return validAt(now) && !unknownCritical && (!ekuPresent || ekuServerAuth) &&
+        return strongKey() && !isCA && validAt(now) && !unknownCritical && (!ekuPresent || ekuServerAuth) &&
             (!keyUsagePresent || keyUsageDigitalSignature)
     }
 
@@ -104,6 +115,7 @@ public class X509Cert {
 
         let sigAlg = cert.enter(0x30)
         c.sigAlg = sigAlg.readOid()
+        c.algorithmParameters = derBytes[sigAlg.pos..sigAlg.end]
         let (unused, signature) = cert.readBitString()
         if (!cert.eof() || unused != 0 || signature.size == 0) {
             throw Exception("invalid Certificate signature")
@@ -116,7 +128,7 @@ public class X509Cert {
         }
         c.serial = tbs.readIntegerBytes()
         let innerSig = tbs.enter(0x30)
-        if (innerSig.readOid() != c.sigAlg) {
+        if (innerSig.readOid() != c.sigAlg || !ctEqual(derBytes[innerSig.pos..innerSig.end], c.algorithmParameters)) {
             throw Exception("certificate signature algorithms differ")
         }
         c.issuer = parseName(tbs.enter(0x30))
@@ -142,6 +154,7 @@ public class X509Cert {
                 alg.readTLV()
             }
         } else if (algOid == "1.3.101.112") {
+            if (!alg.eof()) { throw Exception("invalid Ed25519 parameters") }
             c.keyType = "ED25519"
         } else {
             c.keyType = algOid
@@ -187,7 +200,7 @@ public class X509Cert {
         return c
     }
 
-    private static func parseName(nameSeq: Der): X509Name {
+    static func parseName(nameSeq: Der): X509Name {
         let n = X509Name()
         n.capture(sliceBytes(nameSeq.data, nameSeq.pos, nameSeq.end - nameSeq.pos))
         var first = true
@@ -234,7 +247,9 @@ public class X509Cert {
             c.basicConstraintsPresent = true
             let seq = d.enter(0x30)
             if (!seq.eof() && seq.peekTag() == 0x01) {
-                c.isCA = seq.readContent()[0] != 0
+                let flag = seq.readContent()
+                if (flag.size != 1 || (flag[0] != 0 && flag[0] != 255)) { throw Exception("invalid basicConstraints") }
+                c.isCA = flag[0] != 0
             }
             if (!seq.eof()) {
                 c.pathLen = seq.readInt64()
@@ -248,6 +263,7 @@ public class X509Cert {
             if (bits.size > 0) {
                 c.keyUsageDigitalSignature = (bits[0] & 0x80) != 0
                 c.keyCertSign = (bits[0] & 0x04) != 0
+                c.crlSign = (bits[0] & 0x02) != 0
             }
         } else if (oid == "2.5.29.37") {
             c.ekuPresent = true
@@ -276,8 +292,47 @@ public class X509Cert {
         return None
     }
 
+    private static func digestOid(body: Der): String {
+        let alg = body.enter(0x30)
+        let oid = alg.readOid()
+        if (!alg.eof() && !alg.enter(5).eof()) { throw Exception("invalid digest parameters") }
+        if (!alg.eof() || !body.eof()) { throw Exception("trailing digest parameters") }
+        return oid
+    }
+
+    private func pssDigest(): Option<HashAlg> {
+        // RFC 4055. Support SHA-2, MGF1 with the same digest, and digest-sized salt.
+        // The omitted ASN.1 defaults correspond to SHA-1 and a 20-byte salt.
+        try {
+            let outer = Der.parse(algorithmParameters)
+            let seq = outer.enter(0x30)
+            let hash = digestOid(seq.enter(0xa0))
+            let mask = seq.enter(0xa1)
+            let mgf = mask.enter(0x30)
+            if (!mask.eof() || mgf.readOid() != "1.2.840.113549.1.1.8" || digestOid(mgf) != hash) { return None }
+            let alg = match (hash) {
+                case "2.16.840.1.101.3.4.2.1" => HashAlg.Sha256
+                case "2.16.840.1.101.3.4.2.2" => HashAlg.Sha384
+                case "2.16.840.1.101.3.4.2.3" => HashAlg.Sha512
+                case _ => return None
+            }
+            let salt = seq.enter(0xa2)
+            if (salt.readInt64() != hashSize(alg) || !salt.eof() || !seq.eof() || !outer.eof()) { return None }
+            return Some(alg)
+        } catch (e: Exception) { return None }
+    }
+
     /** Verify that this certificate's signature was produced by `issuer`. */
     public func verifySignedBy(issuer: X509Cert): Bool {
+        if (sigAlg == "1.3.101.112" && issuer.keyType == "ED25519") {
+            return algorithmParameters.isEmpty() && verifyEd25519(issuer.spki, tbs, signature)
+        }
+        if (sigAlg == "1.2.840.113549.1.1.10" && issuer.keyType == "RSA") {
+            if (let Some(alg) <- pssDigest()) {
+                return rsaVerifyPss(issuer.spki, hashOf(alg, tbs), signature, alg)
+            }
+            return false
+        }
         let h = hashFor(sigAlg, tbs)
         if (h.isNone()) {
             return false
@@ -312,6 +367,7 @@ public class X509Cert {
             let seq = d.enter(0x30)
             let r = seq.readIntegerBytes()
             let s = seq.readIntegerBytes()
+            if (!d.eof() || !seq.eof()) { return None }
             return Some((r, s))
         } catch (e: Exception) {
             return None
@@ -335,7 +391,7 @@ public class X509Cert {
         } catch (e: Exception) {
             // A DNS name has no IP address representation.
         }
-        let h = toLowerAscii(host)
+        let h = try { toLowerAscii(asciiHost(host)) } catch (e: Exception) { return false }
         var i = 0
         while (i < sanCount) {
             if (matchName(toLowerAscii(sans[i]), h)) {
@@ -355,19 +411,7 @@ public class X509Cert {
             let suffix = pattern[1..]
             if (host.size > suffix.size && host[host.size - suffix.size..] == suffix) {
                 let prefix = host[0..host.size - suffix.size]
-                var label = prefix
-                if (label.size > 1 && label[label.size - 1] == 46u8) {
-                    label = label[0..label.size - 1]
-                }
-                var hasDot = false
-                var k = 0
-                while (k < label.size) {
-                    if (label[k] == 46u8) {
-                        hasDot = true
-                    }
-                    k++
-                }
-                return !hasDot && label.size > 0
+                return prefix.size > 0 && !prefix.contains(".")
             }
         }
         return false
@@ -376,6 +420,24 @@ public class X509Cert {
 
 /** A set of trusted root certificates. */
 public class TrustStore {
+    /** With CRL checking enabled, verification requires fresh issuer CRLs for the path. */
+    var nativeSystem = false
+    public var requireCrl = false
+    public var requireStapledOcsp = false
+    public let revocationLists = ArrayList<Array<UInt8>>()
+
+    public func addCrlPem(text: String): Unit {
+        let blocks = pemBlocks(text, "X509 CRL")
+        if (blocks.isEmpty()) { throw Exception("no X509 CRL in PEM") }
+        for (block in blocks) {
+            let der = Der.parse(block)
+            der.enter(0x30)
+            if (!der.eof()) { throw Exception("trailing data after CRL") }
+        }
+        for (block in blocks) { revocationLists.add(block) }
+        requireCrl = true
+    }
+
     public var roots: Array<X509Cert>
     public var count: Int64
 
@@ -385,20 +447,16 @@ public class TrustStore {
     }
 
     public func addDer(der: Array<UInt8>): Unit {
-        try {
-            let c = X509Cert.parse(der)
-            if (count == roots.size) {
-                let expanded = Array<X509Cert>(roots.size * 2, repeat: X509Cert())
-                for (i in 0..count) {
-                    expanded[i] = roots[i]
-                }
-                roots = expanded
+        let c = X509Cert.parse(der)
+        if (count == roots.size) {
+            let expanded = Array<X509Cert>(roots.size * 2, repeat: X509Cert())
+            for (i in 0..count) {
+                expanded[i] = roots[i]
             }
-            roots[count] = c
-            count++
-        } catch (e: Exception) {
-            // skip malformed root
+            roots = expanded
         }
+        roots[count] = c
+        count++
     }
 
     public static func fromFile(path: String): TrustStore {
@@ -412,28 +470,75 @@ public class TrustStore {
 
     /** Load the PEM CA bundle configured by SSL_CERT_FILE or installed by the OS. */
     public static func system(): TrustStore {
-        if (let Some(path) <- getVariable("SSL_CERT_FILE")) {
-            if (path != "") {
-                return fromFile(path)
+        let file = getVariable("SSL_CERT_FILE").getOrDefault({ => "" })
+        let dirs = getVariable("SSL_CERT_DIR").getOrDefault({ => "" })
+        if (file != "" || dirs != "") {
+            let store = if (file == "") { TrustStore() } else { fromFile(file) }
+            if (dirs != "") {
+                for (dir in dirs.split(directorySeparator())) {
+                    if (dir != "") { store.addDirectory(dir) }
+                }
             }
+            if (store.count == 0) { throw Exception("empty configured system trust store") }
+            return store
         }
+        return platformDefault()
+    }
+
+    @When[os == "Windows" || os == "macOS"]
+    private static func platformDefault(): TrustStore {
+        let store = TrustStore()
+        store.nativeSystem = true
+        return store
+    }
+
+    @When[os != "Windows" && os != "macOS"]
+    private static func platformDefault(): TrustStore {
         for (path in ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
             "/etc/ssl/cert.pem"]) {
-            try {
-                return fromFile(path)
-            } catch (e: Exception) {
-                // Try the next platform default.
+            if (exists(path)) { return fromFile(path) }
+        }
+        for (dir in ["/apex/com.android.conscrypt/cacerts", "/system/etc/security/cacerts"]) {
+            if (exists(dir)) {
+                let store = TrustStore()
+                store.addDirectory(dir)
+                if (store.count > 0) { return store }
             }
         }
         throw Exception("no system PEM CA bundle; configure SSL_CERT_FILE or supply a TrustStore")
     }
 
+    @When[os == "Windows"]
+    private static func directorySeparator(): String { ";" }
+    @When[os != "Windows"]
+    private static func directorySeparator(): String { ":" }
+
+    public func addDirectory(path: String): Unit {
+        for (entry in Directory.readFrom(path)) {
+            let name = entry.name
+            let parts = name.split(".")
+            var hashed = parts.size == 2 && parts[0].size == 8 && parts[1].size > 0
+            if (hashed) {
+                for (b in parts[0].toArray()) {
+                    hashed = hashed && ((b >= 48 && b <= 57) || (b >= 97 && b <= 102))
+                }
+                for (b in parts[1].toArray()) { hashed = hashed && b >= 48 && b <= 57 }
+            }
+            if ((hashed || name.endsWith(".pem") || name.endsWith(".crt")) && !entry.isDirectory()) {
+                addPem(String.fromUtf8(File.readFrom(entry.path)))
+            }
+        }
+    }
+
     public func addPem(text: String): Unit {
         let blocks = pemCertificates(text)
-        var i = 0
-        while (i < blocks.size) {
-            addDer(blocks[i])
-            i++
+        if (blocks.isEmpty()) { throw Exception("missing PEM certificate") }
+        let previous = count
+        try {
+            for (block in blocks) { addDer(block) }
+        } catch (e: Exception) {
+            count = previous
+            throw e
         }
     }
 
@@ -456,9 +561,10 @@ public class TrustStore {
 public func verifyCertificateChain(chain: Array<X509Cert>, chainCount: Int64,
     store: TrustStore, host: String, now: Int64,
     backend!: CryptoBackend = PURE_CRYPTO): Bool {
-    if (chainCount <= 0 || chainCount > chain.size || chainCount > 8) {
+    if (store.requireStapledOcsp || chainCount <= 0 || chainCount > chain.size || chainCount > 8) {
         return false
     }
+    if (store.nativeSystem) { return verifySystemChain(chain, chainCount, store, host, now, backend) }
     let leaf = chain[0]
     if (!leaf.permitsServer(now) || !leaf.matchesHost(host)) {
         return false
@@ -470,8 +576,9 @@ private func findChain(current: X509Cert, chain: Array<X509Cert>, chainCount: In
     store: TrustStore, now: Int64, backend: CryptoBackend, visited: Int64, depth: Int64): Bool {
     for (i in 0..store.count) {
         let anchor = store.roots[i]
-        if (ctEqual(current.der, anchor.der) ||
-            (anchor.subject.equals(current.issuer) && backend.verifyCertificate(current, anchor))) {
+        if (ctEqual(current.der, anchor.der) && (depth > 0 || !store.requireCrl)) { return true }
+        if (anchor.permitsIssuer(depth, now) && anchor.subject.equals(current.issuer) &&
+            backend.verifyCertificate(current, anchor) && permitsRevocation(current, anchor, store, now)) {
             return true
         }
     }
@@ -480,9 +587,28 @@ private func findChain(current: X509Cert, chain: Array<X509Cert>, chainCount: In
         let candidate = chain[i]
         if ((visited & bit) == 0 && candidate.subject.equals(current.issuer) &&
             candidate.permitsIssuer(depth, now) && backend.verifyCertificate(current, candidate) &&
+            permitsRevocation(current, candidate, store, now) &&
             findChain(candidate, chain, chainCount, store, now, backend, visited | bit, depth + 1)) {
             return true
         }
     }
     return false
+}
+
+func verifySystemChain(chain: Array<X509Cert>, count: Int64, store: TrustStore, host: String, now: Int64,
+    backend: CryptoBackend, staple!: Array<UInt8> = []): Bool {
+    if (count < 1 || count > chain.size || count > 8) { return false }
+    let path = platformChain(chain[0..count], asciiHost(host), now)
+    if (path.isEmpty() || !ctEqual(chain[0].der, path[0].der)) { return false }
+    let anchor = TrustStore()
+    anchor.addDer(path[path.size - 1].der)
+    anchor.requireCrl = store.requireCrl
+    anchor.requireStapledOcsp = store.requireStapledOcsp
+    for (crl in store.revocationLists) { anchor.revocationLists.add(crl) }
+    return backend.verifyPeerChain(path, path.size, anchor, host, now, staple)
+}
+
+@When[os != "Windows" && os != "macOS"]
+func platformChain(chain: Array<X509Cert>, host: String, now: Int64): Array<X509Cert> {
+    throw Exception("native trust evaluation unavailable on this target")
 }

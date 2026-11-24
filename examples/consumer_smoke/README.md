@@ -17,7 +17,7 @@ python3 examples/consumer_smoke/run.py
 
 完整测试使用 C 编译器、OpenSSL 3 运行库和 `openssl` 命令。脚本默认下载仓颉 1.2.1 的 `Cangjie.h` 并检查 SHA-256，可用 `--runtime-header /path/to/Cangjie.h` 指定本地头文件。[仓颉 1.2.1 运行时接口](https://github.com/cangjielanguage/cangjie_runtime/blob/v1.2.1/runtime/src/Cangjie.h)
 
-使用 `--direct-only` 时，仓颉模块只依赖 `quic`，无需 C 编译器或运行时头文件。脚本仍使用 `openssl` 命令生成测试证书。也可直接进入 `direct` 运行 `cjpm build`，再向产物传入主机、UDP 端口和 PEM CA 文件。
+使用 `--direct-only` 时，仓颉模块只依赖 `quic`，无需 C 编译器或运行时头文件。直接消费方使用默认 OpenSSL 3 后端，脚本用 `openssl` 命令生成测试证书。也可直接进入 `direct` 运行 `cjpm build`，再向产物传入主机、UDP 端口和 PEM CA 文件。
 
 ## C ABI 示例
 
